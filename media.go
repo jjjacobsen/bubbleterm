@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -20,6 +21,27 @@ type attachment struct {
 	Missing      bool   `json:"missing"`
 	IsSticker    bool   `json:"is_sticker"`
 	TotalBytes   int64  `json:"total_bytes"`
+}
+
+func visibleAttachments(attachments []attachment) []attachment {
+	var visible []attachment
+	for _, a := range attachments {
+		// Messages stores rich preview data as a plugin payload attachment.
+		if a.MIMEType == "" && strings.EqualFold(path.Ext(a.TransferName), ".pluginPayloadAttachment") {
+			continue
+		}
+		// imsg lists pathless preflight rows alongside the downloaded photo.
+		if a.Missing && a.Filename == "" && a.OriginalPath == "" && !a.IsSticker && a.isPhoto() &&
+			slices.ContainsFunc(attachments, func(photo attachment) bool {
+				return !photo.Missing && photo.Filename != "" && !photo.IsSticker &&
+					photo.TransferName == a.TransferName && path.Base(photo.Filename) == a.TransferName &&
+					photo.MIMEType == a.MIMEType && photo.UTI == a.UTI
+			}) {
+			continue
+		}
+		visible = append(visible, a)
+	}
+	return visible
 }
 
 func (a attachment) isPhoto() bool {

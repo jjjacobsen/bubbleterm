@@ -107,7 +107,11 @@ function resolveTarget(chat, guid, filename) {
     const files = query(`
         SELECT a.filename, a.mime_type AS mime, a.is_sticker AS sticker, a.hide_attachment AS hidden
         FROM message m JOIN message_attachment_join ma ON ma.message_id = m.ROWID
-        JOIN attachment a ON a.ROWID = ma.attachment_id WHERE m.guid COLLATE BINARY = ${guid}`);
+        JOIN attachment a ON a.ROWID = ma.attachment_id WHERE m.guid COLLATE BINARY = ${guid}
+          AND NOT (coalesce(a.filename, '') = '' AND a.preflight_info IS NOT NULL AND EXISTS (
+              SELECT 1 FROM message_attachment_join other JOIN attachment downloaded ON downloaded.ROWID = other.attachment_id
+              WHERE other.message_id = m.ROWID AND downloaded.filename <> ''
+                AND downloaded.transfer_name = a.transfer_name AND downloaded.mime_type = a.mime_type))`);
     let text, part = 0;
     if (filename !== undefined || files.length) {
         const [file] = files;

@@ -9,10 +9,18 @@ import (
 	"strings"
 )
 
-const myReactionQuery = `
-WITH events AS (
+const historyDetailsQuery = `
+WITH targets AS (
+    SELECT ROWID AS id, lower(guid) AS guid,
+           CASE
+               WHEN item_type = 3 AND group_action_type = 0 THEN '[Left the group]'
+               WHEN item_type IN (1, 2, 3) THEN '[Group event]'
+           END AS notice
+    FROM message WHERE ROWID IN (%s)
+), events AS (
     SELECT ROWID AS event_id, date, associated_message_type AS kind,
-           associated_message_emoji AS emoji,
+           associated_message_emoji AS emoji, is_from_me AS from_me,
+           CASE WHEN is_from_me = 1 THEN 0 ELSE handle_id END AS sender,
            CASE WHEN associated_message_guid GLOB 'p:*/*'
                 THEN substr(associated_message_guid, 3, instr(associated_message_guid, '/') - 3)
                 ELSE '0' END AS part,
@@ -21,18 +29,28 @@ WITH events AS (
                       WHEN associated_message_guid GLOB 'bp:*' THEN substr(associated_message_guid, 4)
                       ELSE associated_message_guid END) AS guid
     FROM message
-    WHERE associated_message_guid IS NOT NULL AND is_from_me = 1 AND COALESCE(error, 0) = 0
+    WHERE associated_message_guid IS NOT NULL AND COALESCE(error, 0) = 0
       AND (associated_message_type BETWEEN 2000 AND 2007 OR associated_message_type BETWEEN 3000 AND 3007)
 )
-SELECT guid, part, kind, emoji FROM events
-WHERE guid IN (SELECT lower(guid) FROM message WHERE ROWID IN (%s))
+SELECT targets.id, part, sender, from_me, kind, emoji, NULL AS notice, date, event_id
+FROM events JOIN targets USING (guid)
+UNION ALL
+SELECT id, NULL, NULL, NULL, NULL, NULL, notice, NULL, NULL
+FROM targets WHERE notice IS NOT NULL
 ORDER BY date, event_id`
 
+type reactionKey struct {
+	Part   string `json:"part"`
+	Sender int    `json:"sender"`
+	FromMe int    `json:"from_me"`
+}
+
 type reactionEvent struct {
-	GUID  string `json:"guid"`
-	Part  string `json:"part"`
-	Kind  int    `json:"kind"`
-	Emoji string `json:"emoji"`
+	reactionKey
+	ID     int    `json:"id"`
+	Kind   int    `json:"kind"`
+	Emoji  string `json:"emoji"`
+	Notice string `json:"notice"`
 }
 
 func (r reactionEvent) symbol() string {
@@ -42,7 +60,7 @@ func (r reactionEvent) symbol() string {
 	return [...]string{"❤️", "👍", "👎", "😂", "‼️", "❓", "", "🏷️"}[r.Kind-2000]
 }
 
-func (b backend) loadMyReactions(rows []message) error {
+func (b backend) loadHistoryDetails(rows []message) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -51,41 +69,71 @@ func (b backend) loadMyReactions(rows []message) error {
 		ids[i] = strconv.Itoa(row.ID)
 	}
 	// Match by target GUID, not chat membership: synced reactions can be in a different chat.
-	// imsg history omits bp: targets and does not distinguish body parts or replacements.
-	query := fmt.Sprintf(myReactionQuery, strings.Join(ids, ","))
-	out, err := b.run("read Tapbacks", `exec /usr/bin/sqlite3 -batch -bail -readonly -init /dev/null -json "$HOME/Library/Messages/chat.db" `+shellQuote(query))
+	// imsg does not distinguish body parts or replace different reactions from the same sender.
+	query := fmt.Sprintf(historyDetailsQuery, strings.Join(ids, ","))
+	out, err := b.run("read history details", `exec /usr/bin/sqlite3 -batch -bail -readonly -init /dev/null -json "$HOME/Library/Messages/chat.db" `+shellQuote(query))
 	if err != nil || len(out) == 0 {
 		return err
 	}
 	var events []reactionEvent
 	if err := json.Unmarshal(out, &events); err != nil {
-		return fmt.Errorf("decode Tapbacks: %w", err)
+		return fmt.Errorf("decode history details: %w", err)
 	}
-	active := make(map[string]map[string]reactionEvent)
+	applyHistoryDetails(rows, events)
+	return nil
+}
+
+func applyHistoryDetails(rows []message, events []reactionEvent) {
+	active := make(map[int]map[reactionKey]reactionEvent)
+	notices := make(map[int]string)
 	for _, event := range events {
-		parts := active[event.GUID]
+		if event.Notice != "" {
+			notices[event.ID] = event.Notice
+			continue
+		}
+		reactions := active[event.ID]
+		key := event.reactionKey
 		if event.Kind >= 3000 {
-			previous := parts[event.Part]
-			if event.Kind == previous.Kind+1000 && (event.Emoji == "" || event.Emoji == previous.Emoji) {
-				delete(parts, event.Part)
+			previous := reactions[key]
+			if event.Kind == previous.Kind+1000 && (event.Kind != 3006 || event.Emoji == "" || event.Emoji == previous.Emoji) {
+				delete(reactions, key)
 			}
 			continue
 		}
-		if parts == nil {
-			parts = make(map[string]reactionEvent)
-			active[event.GUID] = parts
+		if reactions == nil {
+			reactions = make(map[reactionKey]reactionEvent)
+			active[event.ID] = reactions
 		}
-		parts[event.Part] = event
+		reactions[key] = event
 	}
 	for i := range rows {
-		parts := active[strings.ToLower(rows[i].GUID)]
-		var symbols []string
-		for _, part := range slices.Sorted(maps.Keys(parts)) {
-			if symbol := parts[part].symbol(); symbol != "" {
-				symbols = append(symbols, symbol)
+		row := &rows[i]
+		if row.Text == "" && len(row.Attachments) == 0 {
+			row.Text = notices[row.ID]
+		}
+		mine := make(map[string]string)
+		others := make(map[string]int)
+		for key, event := range active[row.ID] {
+			if symbol := event.symbol(); symbol != "" {
+				if key.FromMe == 1 {
+					mine[key.Part] = symbol
+				} else {
+					others[symbol]++
+				}
 			}
 		}
-		rows[i].MyReaction = strings.Join(symbols, " ")
+		var symbols []string
+		for _, part := range slices.Sorted(maps.Keys(mine)) {
+			symbols = append(symbols, mine[part])
+		}
+		row.MyReaction = strings.Join(symbols, " ")
+		symbols = symbols[:0]
+		for _, symbol := range slices.Sorted(maps.Keys(others)) {
+			if count := others[symbol]; count > 1 {
+				symbol += "×" + strconv.Itoa(count)
+			}
+			symbols = append(symbols, symbol)
+		}
+		row.OtherReactions = strings.Join(symbols, " ")
 	}
-	return nil
 }

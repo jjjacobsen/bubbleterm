@@ -563,7 +563,13 @@ func (m *ui) setHistory(messages []message) {
 		if reaction != "" {
 			reaction = "[Your " + reaction + "] "
 		}
+		if others := oneLine(item.OtherReactions); others != "" {
+			reaction += "[" + others + "] "
+		}
 		text := cleanText(item.Text)
+		if strings.ContainsRune(text, '\ufffc') {
+			text = strings.TrimSpace(strings.ReplaceAll(text, "\ufffc", ""))
+		}
 		if text == "" && len(item.Attachments) == 0 {
 			text = "[No text]"
 		}

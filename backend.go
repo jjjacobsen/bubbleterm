@@ -31,8 +31,10 @@ type message struct {
 	SenderName         string       `json:"sender_name"`
 	FromMe             bool         `json:"is_from_me"`
 	CreatedAt          time.Time    `json:"created_at"`
+	UnsentAt           *time.Time   `json:"unsent_at"`
 	Attachments        []attachment `json:"attachments"`
 	MyReaction         string       `json:"-"`
+	OtherReactions     string       `json:"-"`
 	SelectedAttachment *attachment  `json:"-"`
 }
 
@@ -220,11 +222,15 @@ func (b backend) history(id, limit int) ([]message, bool, error) {
 	more := len(rows) > limit
 	rows = rows[:min(len(rows), limit)]
 	for i := range rows {
+		rows[i].Attachments = visibleAttachments(rows[i].Attachments)
 		if rows[i].SenderName == "" {
 			rows[i].SenderName = rows[i].Sender
 		}
+		if rows[i].UnsentAt != nil && rows[i].Text == "" && len(rows[i].Attachments) == 0 {
+			rows[i].Text = "[Unsent message]"
+		}
 	}
-	if err := b.loadMyReactions(rows); err != nil {
+	if err := b.loadHistoryDetails(rows); err != nil {
 		return nil, false, err
 	}
 	slices.Reverse(rows)
