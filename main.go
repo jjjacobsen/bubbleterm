@@ -49,6 +49,7 @@ type actionFinished struct {
 }
 
 type photoOpened struct{ err error }
+type videoFinished struct{ err error }
 
 type photoPreview struct{ rows []string }
 
@@ -95,6 +96,7 @@ type ui struct {
 	historyLimit                    int
 	moreHistory                     bool
 	writing, reconnecting           bool
+	videoActive                     bool
 	chatsErr, historyErr, actionErr error
 	watchErr                        error
 }
@@ -268,6 +270,11 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		}
 	case photoOpened:
 		m.writing, m.actionErr = false, msg.err
+	case videoFinished:
+		m.videoActive = false
+		if msg.err != nil {
+			m.actionErr = msg.err
+		}
 	case watchChanged:
 		m.reconnecting, m.watchErr = false, nil
 		return tea.Batch(m.waitForWatch(), m.refresh())
@@ -337,9 +344,15 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		case "i":
 			m.focus, m.draftCursor = uiCompose, len(m.drafts[id])
 		case "enter":
-			if a, ok := m.selectedPhoto(); ok && !m.writing {
-				m.writing, m.actionErr = true, nil
-				return func() tea.Msg { return photoOpened{m.b.openPhoto(a)} }
+			a := m.selectedAttachment()
+			if a.isPhoto() {
+				if !m.writing {
+					m.writing, m.actionErr = true, nil
+					return func() tea.Msg { return photoOpened{m.b.openPhoto(a)} }
+				}
+			} else if a.isVideo() && !m.videoActive {
+				m.videoActive, m.actionErr = true, nil
+				return func() tea.Msg { return videoFinished{m.b.playVideo(a)} }
 			}
 		case "o":
 			if m.moreHistory {
@@ -360,22 +373,22 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m *ui) selectedPhoto() (attachment, bool) {
+func (m *ui) selectedAttachment() attachment {
 	if len(m.rows) == 0 {
-		return attachment{}, false
+		return attachment{}
 	}
 	row := m.rows[m.rowIndex]
 	attachments := m.messages[row.messageIndex].Attachments
 	if row.attachmentIndex >= 0 {
-		a := attachments[row.attachmentIndex]
-		return a, a.isPhoto()
+		return attachments[row.attachmentIndex]
 	}
+	// Keep the photo shortcut on message text. Videos require selection.
 	for _, a := range attachments {
 		if a.isPhoto() {
-			return a, true
+			return a
 		}
 	}
-	return attachment{}, false
+	return attachment{}
 }
 
 func (m *ui) moveHistory(key string) {
@@ -492,13 +505,15 @@ func (m *ui) setHistory(messages []message) {
 		if restore {
 			selected = start + min(offset, max(0, len(m.rows)-start-1))
 		}
-		photos := 0
+		photos, videos := 0, 0
 		for _, a := range item.Attachments {
 			if a.isPhoto() {
 				photos++
+			} else if a.isVideo() {
+				videos++
 			}
 		}
-		photo := 0
+		photo, video := 0, 0
 		for j, a := range item.Attachments {
 			caption, height := "[Attachment]", 0
 			if a.isPhoto() {
@@ -509,6 +524,12 @@ func (m *ui) setHistory(messages []message) {
 				}
 				if thumbnails {
 					height = previewHeight
+				}
+			} else if a.isVideo() {
+				video++
+				caption = "[Video]"
+				if videos > 1 {
+					caption = fmt.Sprintf("[Video %d/%d]", video, videos)
 				}
 			}
 			if restore && j == old.attachmentIndex {
@@ -693,8 +714,11 @@ func (m *ui) footer() []string {
 		if m.moreHistory {
 			keys = "o Older   " + keys
 		}
-		if _, ok := m.selectedPhoto(); ok {
+		a := m.selectedAttachment()
+		if a.isPhoto() {
 			keys = "Enter Photo   " + keys
+		} else if a.isVideo() && !m.videoActive {
+			keys = "Enter Play   " + keys
 		}
 		lines = append(lines, keys)
 	case uiCompose:
@@ -728,6 +752,8 @@ func (m *ui) status() string {
 		return "Reconnecting: " + oneLine(m.watchErr.Error())
 	case m.reconnecting:
 		return "Reconnecting…"
+	case m.videoActive:
+		return "Video active…"
 	}
 	return ""
 }

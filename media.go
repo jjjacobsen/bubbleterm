@@ -39,41 +39,70 @@ func (a attachment) isPhoto() bool {
 	return false
 }
 
+func (a attachment) isVideo() bool {
+	mime := strings.ToLower(a.MIMEType)
+	if strings.HasPrefix(mime, "video/") {
+		return true
+	}
+	if mime != "" && mime != "application/octet-stream" {
+		return false
+	}
+	switch a.UTI {
+	case "public.movie", "public.video", "public.mpeg-4", "com.apple.quicktime-movie":
+		return true
+	}
+	for _, name := range [...]string{a.Filename, a.TransferName} {
+		switch strings.ToLower(path.Ext(name)) {
+		case ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".3gp", ".3g2":
+			return true
+		}
+	}
+	return false
+}
+
 func (a attachment) key() string { return a.Filename }
+
+func (a attachment) attachmentCommand() (string, error) {
+	if a.Missing || a.Filename == "" {
+		return "", errors.New("attachment is not available on the Mac")
+	}
+	if path.Clean(a.Filename) != a.Filename || strings.ContainsAny(a.Filename, "\x00\r\n") {
+		return "", errors.New("invalid attachment path")
+	}
+	return "file=" + shellQuote(a.Filename) + `
+root="$HOME/Library/Messages/Attachments"
+case "$file" in
+    '~/'*) file="$HOME/${file#\~/}" ;;
+esac
+case "$file" in
+    "$root"/*) ;;
+    *) echo 'Attachment path is outside Messages attachments' >&2; exit 1 ;;
+esac
+root=$(/bin/realpath "$root" 2>/dev/null) || exit 1
+file=$(/bin/realpath "$file" 2>/dev/null) || { echo 'Attachment is not available on the Mac' >&2; exit 1; }
+case "$file" in
+    "$root"/*) ;;
+    *) echo 'Resolved attachment path is outside Messages attachments' >&2; exit 1 ;;
+esac
+[ -f "$file" ] || { echo 'Attachment is not a regular file' >&2; exit 1; }
+`, nil
+}
 
 func (a attachment) photoCommand(preview bool) (string, error) {
 	if !a.isPhoto() {
 		return "", errors.New("attachment is not a photo")
 	}
-	if a.Missing || a.Filename == "" {
-		return "", errors.New("photo is not available on the Mac")
-	}
-	if path.Clean(a.Filename) != a.Filename || strings.ContainsAny(a.Filename, "\x00\r\n") {
-		return "", errors.New("invalid photo path")
+	remote, err := a.attachmentCommand()
+	if err != nil {
+		return "", err
 	}
 	size := ""
 	if preview {
 		size = "256"
 	}
-	return "photo=" + shellQuote(a.Filename) + `
-root="$HOME/Library/Messages/Attachments"
-case "$photo" in
-    '~/'*) photo="$HOME/${photo#\~/}" ;;
-esac
-case "$photo" in
-    "$root"/*) ;;
-    *) echo 'Photo path is outside Messages attachments' >&2; exit 1 ;;
-esac
-root=$(/bin/realpath "$root" 2>/dev/null) || exit 1
-photo=$(/bin/realpath "$photo" 2>/dev/null) || { echo 'Photo is not available on the Mac' >&2; exit 1; }
-case "$photo" in
-    "$root"/*) ;;
-    *) echo 'Resolved photo path is outside Messages attachments' >&2; exit 1 ;;
-esac
-[ -f "$photo" ] || { echo 'Photo is not a regular file' >&2; exit 1; }
-tmp=$(/usr/bin/mktemp -d -t bubbleterm) || exit 1
+	return remote + `tmp=$(/usr/bin/mktemp -d -t bubbleterm) || exit 1
 trap '/bin/rm -rf "$tmp"' EXIT
-/usr/bin/osascript -l JavaScript - "$photo" "$tmp/photo.png" ` + shellQuote(size) + ` >/dev/null <<'JXA' || exit 1
+/usr/bin/osascript -l JavaScript - "$file" "$tmp/photo.png" ` + shellQuote(size) + ` >/dev/null <<'JXA' || exit 1
 ObjC.import('ImageIO')
 function run([input, output, size]) {
     const source = $.CGImageSourceCreateWithURL($.NSURL.fileURLWithPath(input), null)
@@ -111,11 +140,38 @@ func (b backend) openPhoto(a attachment) error {
 	return nil
 }
 
+func (b backend) playVideo(a attachment) error {
+	player, err := exec.LookPath("mpv")
+	if err != nil {
+		return fmt.Errorf("play video: %w", err)
+	}
+	remote, err := a.attachmentCommand()
+	if err != nil {
+		return err
+	}
+	file, err := b.cachedAttachment("video-"+b.attachmentKey(a), remote+`exec /bin/cat "$file"`)
+	if err != nil {
+		return err
+	}
+	if err := exec.Command(player, "--no-terminal", "--", file).Run(); err != nil {
+		return fmt.Errorf("play video: %w", err)
+	}
+	return nil
+}
+
 func (b backend) photoFile(a attachment, preview bool) (string, error) {
 	remote, err := a.photoCommand(preview)
 	if err != nil {
 		return "", err
 	}
+	return b.cachedAttachment(fmt.Sprintf("oriented-%s-%t.png", b.attachmentKey(a), preview), remote)
+}
+
+func (b backend) attachmentKey(a attachment) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(b.host+"\x00"+a.key())))
+}
+
+func (b backend) cachedAttachment(name, remote string) (string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
@@ -129,31 +185,30 @@ func (b backend) photoFile(a attachment, preview bool) (string, error) {
 		return "", err
 	}
 	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return "", fmt.Errorf("photo cache is not a private directory: %s", dir)
+		return "", fmt.Errorf("attachment cache is not a private directory: %s", dir)
 	}
 
-	key := sha256.Sum256([]byte(b.host + "\x00" + a.key()))
-	file := filepath.Join(dir, fmt.Sprintf("oriented-%x-%t.png", key, preview))
+	file := filepath.Join(dir, name)
 	info, err = os.Lstat(file)
 	if errors.Is(err, os.ErrNotExist) {
-		if err := b.cachePhoto(dir, file, remote); err != nil {
+		if err := b.cacheAttachment(dir, file, remote); err != nil {
 			return "", err
 		}
 	} else if err != nil {
 		return "", err
 	} else if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return "", fmt.Errorf("cached photo is not a private regular file: %s", file)
+		return "", fmt.Errorf("cached attachment is not a private regular file: %s", file)
 	}
 	return file, nil
 }
 
-func (b backend) cachePhoto(dir, file, remote string) error {
-	out, err := os.CreateTemp(dir, ".photo-*.png")
+func (b backend) cacheAttachment(dir, file, remote string) error {
+	out, err := os.CreateTemp(dir, ".attachment-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(out.Name())
-	transferErr := b.runTo("download photo", remote, out)
+	transferErr := b.runTo("download attachment", remote, out)
 	if err := errors.Join(transferErr, out.Close()); err != nil {
 		return err
 	}
