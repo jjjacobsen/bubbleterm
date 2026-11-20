@@ -4,5 +4,5 @@ go = "1.26"
 [tasks.build]
 run = "go build ./..."
 
-[tasks.run]
+[tasks.chat]
 run = "go run ."

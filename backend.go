@@ -28,6 +28,7 @@ type message struct {
 	Text               string       `json:"text"`
 	Sender             string       `json:"sender"`
 	FromMe             bool         `json:"is_from_me"`
+	CreatedAt          time.Time    `json:"created_at"`
 	Attachments        []attachment `json:"attachments"`
 	MyReaction         string       `json:"-"`
 	SelectedAttachment *attachment  `json:"-"`

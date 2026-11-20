@@ -66,7 +66,7 @@ type watchRetry struct{}
 type catchUp struct{}
 
 type historyRow struct {
-	messageIndex    int
+	messageIndex    int // -1 for a date label
 	attachmentIndex int // -1 for message text
 	photoRow        int // 1 through previewHeight for thumbnail rows
 	text            string
@@ -205,7 +205,7 @@ func (m *ui) resetHistory() tea.Cmd {
 }
 
 func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if key, ok := msg.(tea.KeyMsg); ok && key.String() == "ctrl+c" {
+	if key, ok := msg.(tea.KeyMsg); ok && (key.String() == "ctrl+c" || (key.String() == "q" && m.focus != uiCompose)) {
 		return m, tea.Quit
 	}
 	cmd := m.update(msg)
@@ -414,12 +414,20 @@ func (m *ui) moveHistory(key string) {
 		index -= m.rows[index].photoRow
 	}
 	index = moveIndex(key, index, len(m.rows), m.bodyHeight())
-	if up {
-		index -= m.rows[index].photoRow
-	} else if key == "down" || key == "j" {
+	if key == "down" || key == "j" {
 		for index < len(m.rows)-1 && m.rows[index].photoRow > 0 {
 			index++
 		}
+	}
+	if m.rows[index].messageIndex < 0 {
+		if index > 0 && index < m.rowIndex {
+			index--
+		} else {
+			index++
+		}
+	}
+	if up {
+		index -= m.rows[index].photoRow
 	}
 	m.rowIndex = index
 }
@@ -482,6 +490,25 @@ func moveIndex(key string, index, size, page int) int {
 	return min(max(0, index), max(0, size-1))
 }
 
+func sameDay(a, b time.Time) bool {
+	return a.Year() == b.Year() && a.YearDay() == b.YearDay()
+}
+
+func historyDateLabel(at, now time.Time) string {
+	var date string
+	switch {
+	case sameDay(at, now):
+		date = "Today"
+	case sameDay(at, now.AddDate(0, 0, -1)):
+		date = "Yesterday"
+	case at.Year() == now.Year():
+		date = at.Format("Jan 2")
+	default:
+		date = at.Format("Jan 2, 2006")
+	}
+	return date + " · " + at.Format("3:04 PM")
+}
+
 func (m *ui) setHistory(messages []message) {
 	follow := m.rowIndex >= len(m.rows)-1
 	var old historyRow
@@ -499,7 +526,14 @@ func (m *ui) setHistory(messages []message) {
 	thumbnails := m.thumbnailSpace()
 	m.messages, m.rows = messages, m.rows[:0]
 	selected := -1
+	now := time.Now()
+	var prev time.Time
 	for i, item := range messages {
+		at := item.CreatedAt.Local()
+		if i == 0 || !sameDay(at, prev) || at.Sub(prev) >= time.Hour {
+			m.rows = append(m.rows, historyRow{messageIndex: -1, text: historyDateLabel(at, now)})
+		}
+		prev = at
 		start := len(m.rows)
 		sender := oneLine(item.Sender)
 		if item.FromMe {
@@ -573,6 +607,9 @@ func (m *ui) setHistory(messages []message) {
 		m.rowIndex = selected
 	} else {
 		m.rowIndex = min(m.rowIndex, max(0, len(m.rows)-1))
+		if len(m.rows) > 0 && m.rows[m.rowIndex].messageIndex < 0 {
+			m.rowIndex++
+		}
 	}
 }
 
@@ -634,10 +671,15 @@ func (m *ui) keepSelectionVisible() {
 	height := max(1, m.bodyHeight())
 	m.chatTop = scrollTop(m.chatTop, m.chatIndex, height, len(m.chats))
 	m.rowTop = scrollTop(m.rowTop, m.rowIndex, height, len(m.rows))
-	if height > previewHeight && len(m.rows) > 0 {
-		index := m.rowIndex - m.rows[m.rowIndex].photoRow
-		if index+1 < len(m.rows) && m.rows[index+1].photoRow == 1 {
-			m.rowTop = min(index, max(m.rowTop, index+previewHeight-height+1))
+	if len(m.rows) > 0 {
+		start := m.rowIndex - m.rows[m.rowIndex].photoRow
+		end := m.rowIndex
+		if height > previewHeight && start+1 < len(m.rows) && m.rows[start+1].photoRow == 1 {
+			end = start + previewHeight
+			m.rowTop = min(start, max(m.rowTop, end-height+1))
+		}
+		if start > 0 && m.rowTop == start && m.rows[start-1].messageIndex < 0 && end-start+2 <= height {
+			m.rowTop--
 		}
 	}
 }
@@ -705,7 +747,12 @@ func (m *ui) historyLine(row int) string {
 	if index >= len(m.rows) {
 		return ""
 	}
-	line, current := m.rows[index], m.rows[m.rowIndex]
+	line := m.rows[index]
+	if line.messageIndex < 0 {
+		label := ansi.Truncate(line.text, width, "")
+		return strings.Repeat(" ", (width-ansi.StringWidth(label))/2) + "\x1b[2m" + label + "\x1b[22m"
+	}
+	current := m.rows[m.rowIndex]
 	selected := m.focus != uiChats && line.messageIndex == current.messageIndex && line.attachmentIndex == current.attachmentIndex
 	msg := m.messages[line.messageIndex]
 	content := ansi.Truncate(marker(selected)+line.text, width, "")
@@ -735,7 +782,7 @@ func (m *ui) footer() []string {
 	var lines []string
 	switch m.focus {
 	case uiChats:
-		lines = append(lines, "Enter Open   ↑↓ Select   Ctrl+C Quit")
+		lines = append(lines, "Enter Open   ↑↓ Select   q Quit")
 	case uiHistory:
 		keys := "i Compose   r React   Esc Chats   ↑↓ Scroll"
 		if m.moreHistory {
