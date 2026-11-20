@@ -331,6 +331,7 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		switch key {
 		case "tab", "enter", "right":
 			m.focus = uiHistory
+			return m.loadHistory()
 		case "i":
 			m.focus, m.draftCursor = uiCompose, len(m.drafts[id])
 		default:
@@ -363,7 +364,11 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 			}
 		case "r":
 			if !m.writing && len(m.rows) > 0 {
-				m.focus, m.target = uiReact, m.messages[m.rows[m.rowIndex].messageIndex]
+				row := m.rows[m.rowIndex]
+				m.focus, m.target = uiReact, m.messages[row.messageIndex]
+				if row.attachmentIndex >= 0 {
+					m.target.SelectedAttachment = &m.target.Attachments[row.attachmentIndex]
+				}
 			}
 		default:
 			m.moveHistory(key)
@@ -500,6 +505,10 @@ func (m *ui) setHistory(messages []message) {
 		if item.FromMe {
 			sender = "You"
 		}
+		reaction := oneLine(item.MyReaction)
+		if reaction != "" {
+			reaction = "[Your " + reaction + "] "
+		}
 		text := cleanText(item.Text)
 		if text == "" && len(item.Attachments) == 0 {
 			text = "[No text]"
@@ -508,10 +517,10 @@ func (m *ui) setHistory(messages []message) {
 			if sender != "" {
 				text = sender + ": " + text
 			}
-			for _, line := range strings.Split(ansi.Wrap(text, width, ""), "\n") {
+			for _, line := range strings.Split(ansi.Wrap(reaction+text, width, ""), "\n") {
 				m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: -1, text: line})
 			}
-			sender = ""
+			sender, reaction = "", ""
 		}
 		restore := !follow && item.ID == selectedID
 		if restore {
@@ -547,11 +556,11 @@ func (m *ui) setHistory(messages []message) {
 			if restore && j == old.attachmentIndex {
 				selected = len(m.rows) + min(old.photoRow, height)
 			}
-			if sender != "" && width > len(caption)+2 {
-				caption = ansi.Truncate(sender, width-len(caption)-2, "") + ": " + caption
+			if nameWidth := width - ansi.StringWidth(reaction) - len(caption) - 2; sender != "" && nameWidth > 0 {
+				caption = ansi.Truncate(sender, nameWidth, "") + ": " + caption
 			}
-			m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: j, text: caption})
-			sender = ""
+			m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: j, text: reaction + caption})
+			sender, reaction = "", ""
 			for k := 1; k <= height; k++ {
 				m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: j, photoRow: k})
 			}

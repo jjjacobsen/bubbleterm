@@ -23,12 +23,14 @@ type chat struct {
 }
 
 type message struct {
-	ID          int          `json:"id"`
-	GUID        string       `json:"guid"`
-	Text        string       `json:"text"`
-	Sender      string       `json:"sender"`
-	FromMe      bool         `json:"is_from_me"`
-	Attachments []attachment `json:"attachments"`
+	ID                 int          `json:"id"`
+	GUID               string       `json:"guid"`
+	Text               string       `json:"text"`
+	Sender             string       `json:"sender"`
+	FromMe             bool         `json:"is_from_me"`
+	Attachments        []attachment `json:"attachments"`
+	MyReaction         string       `json:"-"`
+	SelectedAttachment *attachment  `json:"-"`
 }
 
 const imsgPath = "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH "
@@ -209,10 +211,16 @@ func (b backend) chats() ([]chat, error) {
 func (b backend) history(id, limit int) ([]message, bool, error) {
 	// imsg has no row cursor. The extra row tells us whether another page exists.
 	rows, err := readRows[message](b, "read history", fmt.Sprintf("history --chat-id %d --limit %d --attachments --json", id, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
 	more := len(rows) > limit
 	rows = rows[:min(len(rows), limit)]
+	if err := b.loadMyReactions(rows); err != nil {
+		return nil, false, err
+	}
 	slices.Reverse(rows)
-	return rows, more, err
+	return rows, more, nil
 }
 
 func shellQuote(value string) string {
@@ -225,7 +233,11 @@ func (b backend) send(id int, text string) error {
 }
 
 func (b backend) react(id int, m message, kind string) error {
-	_, err := b.run("react to message", fmt.Sprintf(`exec "$HOME/.local/bin/bubbleterm-react" %d %s %s`, id, shellQuote(m.GUID), shellQuote(kind)))
+	command := fmt.Sprintf(`exec "$HOME/.local/bin/bubbleterm-react" %d %s %s`, id, shellQuote(m.GUID), shellQuote(kind))
+	if m.SelectedAttachment != nil {
+		command += " --attachment " + shellQuote(m.SelectedAttachment.Filename)
+	}
+	_, err := b.run("react to message", command)
 	return err
 }
 

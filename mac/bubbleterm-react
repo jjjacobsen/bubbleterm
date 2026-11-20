@@ -53,10 +53,42 @@ function messageText(row) {
     return decodeURIComponent(body.slice(start, end).replace(/../g, '%$&'));
 }
 
-function resolveTarget(chat, guid) {
+function mediaKind(mime) {
+    if (/^image\/(?!svg)/i.test(mime)) return 'picture';
+    if (/^video\//i.test(mime)) return 'video';
+    return null;
+}
+
+function clock(seconds) {
+    const date = $.NSDate.dateWithTimeIntervalSince1970(seconds);
+    return ObjC.unwrap($.NSDateFormatter.localizedStringFromDateDateStyleTimeStyle(date, 0, 1));
+}
+
+function resolveMedia(chat, guid, target, kind) {
+    if (target.service !== 'iMessage' || !target.seconds) throw new Error('No usable media timestamp or sender direction');
+    const minute = clock(target.seconds);
+    // AX exposes only a clock time, not the date, file name, or GUID. Search all dates in the chat.
+    const competitors = query(`
+        SELECT DISTINCT m.date / 1000000000 + 978307200 AS seconds, a.mime_type AS mime
+        FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
+        JOIN message_attachment_join ma ON ma.message_id = m.ROWID
+        JOIN attachment a ON a.ROWID = ma.attachment_id
+        WHERE j.chat_id = ${chat} AND m.guid COLLATE BINARY <> ${guid}
+          AND (m.is_from_me = ${target.outgoing} OR m.is_from_me IS NULL OR m.service IS NOT 'iMessage')
+          AND NOT (m.is_audio_message IS 1 AND (a.mime_type IS NULL OR a.mime_type LIKE 'audio/%'))
+          AND strftime('%M', m.date / 1000000000 + 978307200, 'unixepoch', 'localtime') =
+              strftime('%M', ${target.seconds}, 'unixepoch', 'localtime')`);
+    if (competitors.some(row => (!mediaKind(row.mime) || mediaKind(row.mime) === kind) && clock(row.seconds) === minute)) {
+        throw new Error('Media type and clock time do not identify a unique balloon in this chat');
+    }
+    return { ...target, kind, minute, part: 0 };
+}
+
+function resolveTarget(chat, guid, filename) {
     const rows = query(`
         SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, m.is_from_me AS outgoing,
-               m.text, CASE WHEN m.text IS NULL THEN hex(m.attributedBody) END AS body
+               m.service, m.date / 1000000000 + 978307200 AS seconds, m.part_count AS parts,
+               m.text, hex(m.attributedBody) AS body
         FROM chat c
         JOIN chat_message_join j ON j.chat_id = c.ROWID
         JOIN message m ON m.ROWID = j.message_id
@@ -66,29 +98,52 @@ function resolveTarget(chat, guid) {
           AND (SELECT count(*) FROM chat_message_join WHERE message_id = m.ROWID) = 1
           AND COALESCE(m.associated_message_type, 0) = 0 AND COALESCE(m.is_system_message, 0) = 0
           AND COALESCE(m.date_edited, 0) = 0 AND COALESCE(m.date_retracted, 0) = 0
-          AND NOT EXISTS (SELECT 1 FROM message_attachment_join WHERE message_id = m.ROWID)`);
-    if (rows.length !== 1) throw new Error('No unambiguous plain-text target in that chat');
+          AND COALESCE(m.item_type, 0) = 0 AND m.balloon_bundle_id IS NULL`);
+    if (rows.length !== 1) throw new Error('No unambiguous target in that chat');
     const target = rows[0];
-    const text = messageText(target);
-    if (!text || !text.trim() || /[\x00\ufffc\ufffd]/.test(text) || target.identifier.includes('\x00')) {
-        throw new Error('The target has no usable plain text or chat identifier');
+    if (target.identifier.includes('\x00') || ![0, 1].includes(target.outgoing)) {
+        throw new Error('The target has no usable chat identifier or sender direction');
     }
+    const files = query(`
+        SELECT a.filename, a.mime_type AS mime, a.is_sticker AS sticker, a.hide_attachment AS hidden
+        FROM message m JOIN message_attachment_join ma ON ma.message_id = m.ROWID
+        JOIN attachment a ON a.ROWID = ma.attachment_id WHERE m.guid COLLATE BINARY = ${guid}`);
+    let text, part = 0;
+    if (filename !== undefined || files.length) {
+        const [file] = files;
+        if (files.length !== 1 || file.hidden || file.sticker || !mediaKind(file.mime) ||
+            (filename !== undefined && file.filename !== filename)) {
+            throw new Error('Cannot isolate the selected photo or video part');
+        }
+        const body = messageText({ ...target, text: null });
+        // Only handle a standalone attachment or a leading attachment followed by one caption.
+        const caption = body.slice(1);
+        if (!body.startsWith('\ufffc') || caption.includes('\ufffc') || target.parts !== (caption ? 2 : 1)) {
+            throw new Error('Cannot identify the attachment and caption parts');
+        }
+        if (filename !== undefined || !caption) return resolveMedia(chat, guid, target, mediaKind(file.mime));
+        text = caption;
+        part = 1;
+    } else {
+        text = messageText(target);
+    }
+    if (!text || !text.trim() || /[\x00\ufffc\ufffd]/.test(text)) throw new Error('The target has no usable text');
 
     // The selected chat is verified separately. Only matching messages in that chat can collide.
     const needle = sqlQuote(text);
     const duplicates = query(`
-        SELECT m.is_from_me AS outgoing, m.text,
-               CASE WHEN m.text IS NULL THEN hex(m.attributedBody) END AS body
+        SELECT m.is_from_me AS outgoing, m.text, hex(m.attributedBody) AS body
         FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
         WHERE j.chat_id = ${chat} AND m.guid COLLATE BINARY <> ${guid}
           AND COALESCE(m.associated_message_type, 0) = 0
           AND (m.text COLLATE BINARY = ${needle}
-               OR (m.text IS NULL AND instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0))`)
-        .filter(row => messageText(row) === text);
+               OR (instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0
+                   AND (m.text IS NULL OR instr(m.attributedBody, x'EFBFBC') > 0)))`)
+        .filter(row => row.text === text || messageText({ ...row, text: null }).split('\ufffc').includes(text));
     if (duplicates.some(row => row.outgoing === target.outgoing)) {
         throw new Error('Target text is not unique for that sender direction in this chat');
     }
-    return { ...target, text, ambiguousDirection: duplicates.length > 0 };
+    return { ...target, text, part, ambiguousDirection: duplicates.length > 0 };
 }
 
 function attr(element, name) {
@@ -186,7 +241,36 @@ function horizontalBounds(element) {
     return [Number(match[1]), Number(match[1]) + Number(match[2])];
 }
 
-function withTargetMenu(target, itemID, check, useItem) {
+function targetBalloons(view, target) {
+    const visible = value(view, 'AXVisibleChildren') || children(view);
+    if (target.kind) {
+        return visible.flatMap(row => {
+            const description = value(row, 'AXDescription');
+            if (!description || !description.endsWith(', ' + target.minute)) return [];
+            const [sender, label] = description.split(', ');
+            if (label !== 'Includes ' + target.kind || !sender ||
+                (target.outgoing ? sender !== 'Your iMessage' : sender.startsWith('Your '))) return [];
+            const buttons = children(row).filter(el => role(el) === 'AXButton' && identifier(el) === 'Sticker');
+            if (buttons.length !== 1 || value(buttons[0], 'AXDescription') !== description) {
+                throw new Error('Cannot isolate the media button in the matching row');
+            }
+            return buttons;
+        });
+    }
+    return visible.flatMap(child => find(child, el => identifier(el) === 'CKBalloonTextView' &&
+        value(el, 'AXValue') === target.text)).filter(balloon => {
+        if (!target.ambiguousDirection) return true;
+        // Self chats can display a sent and a received copy of the same text.
+        const [left, right] = horizontalBounds(view);
+        const [start, end] = horizontalBounds(balloon);
+        const middle = (left + right) / 2;
+        if (start > middle) return target.outgoing === 1;
+        if (end < middle) return target.outgoing === 0;
+        throw new Error('Cannot distinguish the sender direction of a matching balloon');
+    });
+}
+
+function withTargetMenu(target, itemID, mode, useItem) {
     if (!$.AXIsProcessTrusted()) throw new Error('Grant Accessibility access to the process that runs this helper');
     // Messages uses different prefixes for regular and pinned sidebar rows.
     const selected = () => {
@@ -194,9 +278,9 @@ function withTargetMenu(target, itemID, check, useItem) {
             ' CKLastSelectedItemIdentifier 2>/dev/null || true');
         return row === 'list-' + target.chatGUID || row === 'pinned-' + target.chatGUID;
     };
-    // Do not open a chat in check mode, since that can mark messages as read.
-    if (check && !selected()) throw new Error('Select the target chat in Messages before running --check');
-    if (!check) {
+    // Opening a chat can mark messages as read.
+    if (mode && !selected()) throw new Error('Select the target chat in Messages before running ' + mode);
+    if (!mode) {
         const url = 'sms://open?groupid=' + encodeURIComponent(target.identifier);
         shell.doShellScript('/usr/bin/open -b ' + bundle + ' ' + shellQuote(url) + ' 2>/dev/null');
     }
@@ -227,31 +311,24 @@ function withTargetMenu(target, itemID, check, useItem) {
     let current = waitFor(transcript, 3);
     if (!current) throw new Error('Cannot verify the selected Messages transcript');
     for (let page = 0; page <= 3; page++) {
-        const visible = value(current.view, 'AXVisibleChildren') || children(current.view);
-        const matches = visible.flatMap(child => find(child, el => identifier(el) === 'CKBalloonTextView' &&
-            value(el, 'AXValue') === target.text)).filter(balloon => {
-            if (!target.ambiguousDirection) return true;
-            // Self chats can display a sent and a received copy of the same text.
-            const [left, right] = horizontalBounds(current.view);
-            const [start, end] = horizontalBounds(balloon);
-            const middle = (left + right) / 2;
-            if (start > middle) return target.outgoing === 1;
-            if (end < middle) return target.outgoing === 0;
-            throw new Error('Cannot distinguish the sender direction of a matching balloon');
-        });
-        if (matches.length > 1) throw new Error('More than one balloon matches the target text');
+        const matches = targetBalloons(current.view, target);
+        if (matches.length > 1) throw new Error('More than one balloon matches the target');
         if (matches.length === 1) {
-            const parent = attr(matches[0], 'AXParent');
+            const balloon = matches[0];
+            const owner = target.kind ? balloon : attr(balloon, 'AXParent');
             const window = focusedWindow();
-            if (!window || !$.CFEqual(window, current.window) || !parent || !hasAction(parent, 'AXShowMenu')) {
+            if (!window || !$.CFEqual(window, current.window) || !owner || !hasAction(owner, 'AXShowMenu')) {
                 throw new Error('Cannot open the exact target balloon menu');
             }
-            return withMenuItem(app, window, parent, () => {
+            if (mode === '--dry-run') return 'Tapback target found. No menu opened or reaction sent.';
+            return withMenuItem(app, window, owner, () => {
                 const focused = focusedWindow();
                 if (!focused || !$.CFEqual(focused, window)) throw new Error('Messages switched chats or windows');
-                if (value(matches[0], 'AXValue') !== target.text) throw new Error('The target balloon changed');
+                const found = targetBalloons(current.view, target);
+                if (found.length !== 1 || !$.CFEqual(found[0], balloon)) throw new Error('The target balloon changed');
             }, itemID, useItem);
         }
+        if (mode === '--dry-run') throw new Error('Target balloon is not visible in the selected chat');
         if (page === 3) break;
         const scroll = 'AXScrollUpByPage';
         let el = current.view;
@@ -265,44 +342,53 @@ function withTargetMenu(target, itemID, check, useItem) {
 }
 
 function run(args) {
-    const check = args[0] === '--check';
-    const preview = check || args[0] === '--dry-run';
-    if (preview) args = args.slice(1);
-    const [chat, guid, kind] = args;
+    const mode = ['--check', '--dry-run'].includes(args[0]) ? args.shift() : null;
+    const [chat, guid, kind, option, filename] = args;
     const reaction = tapbacks.findIndex(entry => entry[0] === kind);
-    if (args.length !== 3 || !/^[1-9][0-9]{0,18}$/.test(chat) ||
-        (chat.length === 19 && chat > '9223372036854775807') || !guid || reaction < 0) {
-        throw new Error('Usage: bubbleterm-react [--check|--dry-run] CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question');
+    if ((args.length !== 3 && !(args.length === 5 && option === '--attachment' && filename)) ||
+        !/^[1-9][0-9]{0,18}$/.test(chat) || (chat.length === 19 && chat > '9223372036854775807') || !guid || reaction < 0) {
+        throw new Error('Usage: bubbleterm-react [--check|--dry-run] CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question [--attachment FILENAME]');
     }
-    const target = resolveTarget(chat, sqlQuote(guid));
+    const target = resolveTarget(chat, sqlQuote(guid), filename);
     const itemID = tapbacks[reaction][1];
-    if (preview) return withTargetMenu(target, itemID, check, () => 'Tapback target verified. No reaction sent.');
+    if (mode) return withTargetMenu(target, itemID, mode, () => 'Tapback target verified. No reaction sent.');
     const type = 2000 + reaction;
+    const lowerGUID = guid.toLowerCase();
+    const partGUID = 'p:' + target.part + '/' + lowerGUID;
+    // Synced reactions may be linked to a different chat but still address this exact GUID.
     const events = (after = 0) => query(`
-        SELECT m.guid, m.associated_message_guid AS target, m.associated_message_type AS type
-        FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID
-        WHERE j.chat_id = ${chat} AND m.is_from_me = 1 AND COALESCE(m.error, 0) = 0
-          AND m.ROWID > ${after}
-          AND (m.associated_message_type BETWEEN 2000 AND 2006 OR m.associated_message_type BETWEEN 3000 AND 3006)
-          AND (m.associated_message_guid IN (${sqlQuote(guid)}, ${sqlQuote('bp:' + guid)})
-               OR (substr(m.associated_message_guid, 1, 2) = 'p:'
-                   AND substr(m.associated_message_guid, instr(m.associated_message_guid, '/') + 1) = ${sqlQuote(guid)}))
-        ORDER BY m.ROWID`).filter(row => row.target === guid || row.target.replace(/^(?:p:[0-9]+\/|bp:)/, '') === guid);
+        SELECT guid, lower(associated_message_guid) AS target, associated_message_type AS type
+        FROM message
+        WHERE is_from_me = 1 AND COALESCE(error, 0) = 0 AND ROWID > ${after}
+          AND (associated_message_type BETWEEN 2000 AND 2006 OR associated_message_type BETWEEN 3000 AND 3006)
+          AND (lower(associated_message_guid) IN (${sqlQuote(lowerGUID)}, ${sqlQuote('bp:' + lowerGUID)})
+               OR (substr(lower(associated_message_guid), 1, 2) = 'p:'
+                   AND lower(substr(associated_message_guid, instr(associated_message_guid, '/') + 1)) = ${sqlQuote(lowerGUID)}))
+        ORDER BY date, ROWID`).filter(row => row.target === lowerGUID || row.target.replace(/^(?:p:[0-9]+\/|bp:)/, '') === lowerGUID);
+    const onPart = row => row.target === partGUID || (target.part === 0 && (
+        (row.target === lowerGUID && (!target.kind || target.parts === 1)) ||
+        (row.target === 'bp:' + lowerGUID && !target.kind)
+    ));
+    const prior = events();
+    if (prior.some(row => !row.target.startsWith('p:') && !onPart(row))) {
+        throw new Error('An existing tapback does not identify a part');
+    }
     let active = null;
-    for (const row of events()) {
+    for (const row of prior.filter(onPart)) {
         if (row.type < 3000) active = row;
         else if (active && row.type === active.type + 1000) active = null;
     }
     if (active && active.type === type) return active.guid;
 
     const after = query('SELECT CAST(COALESCE(max(ROWID), 0) AS TEXT) AS id FROM message')[0].id;
-    return withTargetMenu(target, itemID, false, item => {
+    return withTargetMenu(target, itemID, null, item => {
         // Never press again: even a failed AX call can have applied the tapback.
         try {
             const status = $.AXUIElementPerformAction(item, 'AXPress');
             const recorded = waitFor(() => {
                 const added = events(after).filter(row => row.type < 3000);
                 if (added.length > 1) throw new Error('More than one tapback was added to the target');
+                if (added.length && !onPart(added[0])) throw new Error('A tapback was recorded on a different part');
                 return added.length && added[0].type === type && added[0].guid;
             }, 5);
             if (recorded) return recorded;
