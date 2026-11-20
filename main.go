@@ -313,6 +313,9 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	id := m.chats[m.chatIndex].ID
+	if (m.focus == uiChats || m.focus == uiHistory) && (key == "J" || key == "K") {
+		return m.moveChat(strings.ToLower(key))
+	}
 	switch m.focus {
 	case uiCompose:
 		return m.compose(id, k)
@@ -331,11 +334,7 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		case "i":
 			m.focus, m.draftCursor = uiCompose, len(m.drafts[id])
 		default:
-			next := moveIndex(key, m.chatIndex, len(m.chats), m.bodyHeight())
-			if next != m.chatIndex {
-				m.chatIndex = next
-				return m.resetHistory()
-			}
+			return m.moveChat(key)
 		}
 	case uiHistory:
 		switch key {
@@ -389,6 +388,15 @@ func (m *ui) selectedAttachment() attachment {
 		}
 	}
 	return attachment{}
+}
+
+func (m *ui) moveChat(key string) tea.Cmd {
+	next := moveIndex(key, m.chatIndex, len(m.chats), m.bodyHeight())
+	if next == m.chatIndex {
+		return nil
+	}
+	m.chatIndex = next
+	return m.resetHistory()
 }
 
 func (m *ui) moveHistory(key string) {
@@ -453,6 +461,10 @@ func moveIndex(key string, index, size, page int) int {
 		index--
 	case "down", "j":
 		index++
+	case "ctrl+u":
+		index -= max(1, page/2)
+	case "ctrl+d":
+		index += max(1, page/2)
 	case "pgup":
 		index -= max(1, page-1)
 	case "pgdown":
