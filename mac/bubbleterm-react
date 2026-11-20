@@ -188,9 +188,12 @@ function horizontalBounds(element) {
 
 function withTargetMenu(target, itemID, check, useItem) {
     if (!$.AXIsProcessTrusted()) throw new Error('Grant Accessibility access to the process that runs this helper');
-    // Messages stores the selected sidebar row as list-<chat GUID>.
-    const selected = () => shell.doShellScript('/usr/bin/defaults read ' + bundle +
-        ' CKLastSelectedItemIdentifier 2>/dev/null || true') === 'list-' + target.chatGUID;
+    // Messages uses different prefixes for regular and pinned sidebar rows.
+    const selected = () => {
+        const row = shell.doShellScript('/usr/bin/defaults read ' + bundle +
+            ' CKLastSelectedItemIdentifier 2>/dev/null || true');
+        return row === 'list-' + target.chatGUID || row === 'pinned-' + target.chatGUID;
+    };
     // Do not open a chat in check mode, since that can mark messages as read.
     if (check && !selected()) throw new Error('Select the target chat in Messages before running --check');
     if (!check) {
@@ -263,16 +266,17 @@ function withTargetMenu(target, itemID, check, useItem) {
 
 function run(args) {
     const check = args[0] === '--check';
-    if (check) args = args.slice(1);
+    const preview = check || args[0] === '--dry-run';
+    if (preview) args = args.slice(1);
     const [chat, guid, kind] = args;
     const reaction = tapbacks.findIndex(entry => entry[0] === kind);
     if (args.length !== 3 || !/^[1-9][0-9]{0,18}$/.test(chat) ||
         (chat.length === 19 && chat > '9223372036854775807') || !guid || reaction < 0) {
-        throw new Error('Usage: bubbleterm-react [--check] CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question');
+        throw new Error('Usage: bubbleterm-react [--check|--dry-run] CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question');
     }
     const target = resolveTarget(chat, sqlQuote(guid));
     const itemID = tapbacks[reaction][1];
-    if (check) return withTargetMenu(target, itemID, true, () => 'Tapback target verified. No reaction sent.');
+    if (preview) return withTargetMenu(target, itemID, check, () => 'Tapback target verified. No reaction sent.');
     const type = 2000 + reaction;
     const events = (after = 0) => query(`
         SELECT m.guid, m.associated_message_guid AS target, m.associated_message_type AS type
