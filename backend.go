@@ -18,8 +18,9 @@ import (
 type backend struct{ host string }
 
 type chat struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
+	ID      int    `json:"id"`
+	Name    string `json:"name"`
+	IsGroup bool   `json:"is_group"`
 }
 
 type message struct {
@@ -27,6 +28,7 @@ type message struct {
 	GUID               string       `json:"guid"`
 	Text               string       `json:"text"`
 	Sender             string       `json:"sender"`
+	SenderName         string       `json:"sender_name"`
 	FromMe             bool         `json:"is_from_me"`
 	CreatedAt          time.Time    `json:"created_at"`
 	Attachments        []attachment `json:"attachments"`
@@ -217,6 +219,11 @@ func (b backend) history(id, limit int) ([]message, bool, error) {
 	}
 	more := len(rows) > limit
 	rows = rows[:min(len(rows), limit)]
+	for i := range rows {
+		if rows[i].SenderName == "" {
+			rows[i].SenderName = rows[i].Sender
+		}
+	}
 	if err := b.loadMyReactions(rows); err != nil {
 		return nil, false, err
 	}

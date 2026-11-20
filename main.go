@@ -73,10 +73,12 @@ type historyRow struct {
 }
 
 type ui struct {
-	b      *backend
-	g      *graphics
-	events chan struct{}
-	done   <-chan struct{}
+	b       *backend
+	g       *graphics
+	events  chan struct{}
+	done    <-chan struct{}
+	accent  themeAccent
+	accents chan themeAccent
 
 	previews     map[string]*photoPreview
 	previewsBusy int
@@ -117,6 +119,8 @@ func runUI(b *backend) error {
 	g := newGraphics()
 	defer g.close()
 	m := &ui{b: b, g: g, events: make(chan struct{}, 1), done: done, drafts: make(map[int][]rune)}
+	m.accents = make(chan themeAccent)
+	go watchAccent(done, m.accents)
 	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(func(_ tea.Model, msg tea.Msg) tea.Msg {
 		switch msg.(type) {
 		case tea.QuitMsg, tea.InterruptMsg:
@@ -128,7 +132,7 @@ func runUI(b *backend) error {
 }
 
 func (m *ui) Init() tea.Cmd {
-	return tea.Batch(m.loadChats(), m.watch(), m.waitForWatch(), catchUpLater())
+	return tea.Batch(m.loadChats(), m.watch(), m.waitForWatch(), m.waitForAccent, catchUpLater())
 }
 
 func (m *ui) watch() tea.Cmd {
@@ -215,6 +219,9 @@ func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *ui) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
+	case themeAccent:
+		m.accent = msg
+		return m.waitForAccent
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.setHistory(m.messages)
@@ -527,18 +534,31 @@ func (m *ui) setHistory(messages []message) {
 	m.messages, m.rows = messages, m.rows[:0]
 	selected := -1
 	now := time.Now()
+	isGroup := len(m.chats) > 0 && m.chats[m.chatIndex].IsGroup
 	var prev time.Time
+	var prevSender string
 	for i, item := range messages {
 		at := item.CreatedAt.Local()
 		if i == 0 || !sameDay(at, prev) || at.Sub(prev) >= time.Hour {
 			m.rows = append(m.rows, historyRow{messageIndex: -1, text: historyDateLabel(at, now)})
+			prevSender = ""
 		}
 		prev = at
 		start := len(m.rows)
-		sender := oneLine(item.Sender)
-		if item.FromMe {
-			sender = "You"
+		var sender, senderID string
+		if isGroup && !item.FromMe {
+			senderID = item.Sender
+			if senderID == "" {
+				senderID = item.SenderName
+			}
+			if senderID != prevSender {
+				sender = oneLine(item.SenderName)
+				if sender == "" {
+					sender = oneLine(item.Sender)
+				}
+			}
 		}
+		prevSender = senderID
 		reaction := oneLine(item.MyReaction)
 		if reaction != "" {
 			reaction = "[Your " + reaction + "] "
@@ -755,17 +775,21 @@ func (m *ui) historyLine(row int) string {
 	current := m.rows[m.rowIndex]
 	selected := m.focus != uiChats && line.messageIndex == current.messageIndex && line.attachmentIndex == current.attachmentIndex
 	msg := m.messages[line.messageIndex]
-	content := ansi.Truncate(marker(selected)+line.text, width, "")
+	mark := marker(selected)
+	content := ansi.Truncate(mark+line.text, width, "")
 	cells := ansi.StringWidth(content)
 	if line.photoRow > 0 {
 		// Count placeholder cells without changing the graphics escapes.
 		cells = 2 + previewWidth
 		a := msg.Attachments[line.attachmentIndex]
 		if p := m.previews[a.key()]; p != nil && p.rows != nil {
-			content = marker(selected) + p.rows[line.photoRow-1]
+			content = mark + p.rows[line.photoRow-1]
 		}
 	}
 	if msg.FromMe {
+		if line.attachmentIndex < 0 && len(content) > len(mark) {
+			content = mark + string(m.accent) + content[len(mark):] + "\x1b[39m"
+		}
 		return strings.Repeat(" ", max(0, width-cells)) + content
 	}
 	return content
