@@ -23,11 +23,12 @@ type chat struct {
 }
 
 type message struct {
-	ID     int    `json:"id"`
-	GUID   string `json:"guid"`
-	Text   string `json:"text"`
-	Sender string `json:"sender"`
-	FromMe bool   `json:"is_from_me"`
+	ID          int          `json:"id"`
+	GUID        string       `json:"guid"`
+	Text        string       `json:"text"`
+	Sender      string       `json:"sender"`
+	FromMe      bool         `json:"is_from_me"`
+	Attachments []attachment `json:"attachments"`
 }
 
 const imsgPath = "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH "
@@ -148,18 +149,25 @@ func remoteError(op string, err error, out []byte) error {
 }
 
 func (b backend) run(op, remote string) ([]byte, error) {
+	var out bytes.Buffer
+	if err := b.runTo(op, remote, &out); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func (b backend) runTo(op, remote string, out io.Writer) error {
 	s, err := b.open()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	cmd := s.ssh(s.ctx, "--", b.host, remote)
 	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, remoteError(op, err, stderr.Bytes())
+	cmd.Stdout, cmd.Stderr = out, &stderr
+	if err := cmd.Run(); err != nil {
+		return remoteError(op, err, stderr.Bytes())
 	}
-	return out, nil
+	return nil
 }
 
 func readRows[T any](b backend, op, remote string) ([]T, error) {
@@ -200,7 +208,7 @@ func (b backend) chats() ([]chat, error) {
 
 func (b backend) history(id, limit int) ([]message, bool, error) {
 	// imsg has no row cursor. The extra row tells us whether another page exists.
-	rows, err := readRows[message](b, "read history", fmt.Sprintf("history --chat-id %d --limit %d --json", id, limit+1))
+	rows, err := readRows[message](b, "read history", fmt.Sprintf("history --chat-id %d --limit %d --attachments --json", id, limit+1))
 	more := len(rows) > limit
 	rows = rows[:min(len(rows), limit)]
 	slices.Reverse(rows)
