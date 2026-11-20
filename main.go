@@ -707,15 +707,21 @@ func (m *ui) historyLine(row int) string {
 	}
 	line, current := m.rows[index], m.rows[m.rowIndex]
 	selected := m.focus != uiChats && line.messageIndex == current.messageIndex && line.attachmentIndex == current.attachmentIndex
-	if line.photoRow == 0 {
-		return ansi.Truncate(marker(selected)+line.text, width, "")
+	msg := m.messages[line.messageIndex]
+	content := ansi.Truncate(marker(selected)+line.text, width, "")
+	cells := ansi.StringWidth(content)
+	if line.photoRow > 0 {
+		// Count placeholder cells without changing the graphics escapes.
+		cells = 2 + previewWidth
+		a := msg.Attachments[line.attachmentIndex]
+		if p := m.previews[a.key()]; p != nil && p.rows != nil {
+			content = marker(selected) + p.rows[line.photoRow-1]
+		}
 	}
-	a := m.messages[line.messageIndex].Attachments[line.attachmentIndex]
-	if p := m.previews[a.key()]; p != nil && p.rows != nil {
-		// Graphics rows already fit this pane. Keep their escapes intact.
-		return marker(selected) + p.rows[line.photoRow-1]
+	if msg.FromMe {
+		return strings.Repeat(" ", max(0, width-cells)) + content
 	}
-	return marker(selected)
+	return content
 }
 
 func (m *ui) bodyHeight() int {
