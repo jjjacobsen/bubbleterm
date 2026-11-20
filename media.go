@@ -26,8 +26,7 @@ type attachment struct {
 func visibleAttachments(attachments []attachment) []attachment {
 	var visible []attachment
 	for _, a := range attachments {
-		// Messages stores rich preview data as a plugin payload attachment.
-		if a.MIMEType == "" && strings.EqualFold(path.Ext(a.TransferName), ".pluginPayloadAttachment") {
+		if a.isPreviewPayload() {
 			continue
 		}
 		// imsg lists pathless preflight rows alongside the downloaded photo.
@@ -42,6 +41,16 @@ func visibleAttachments(attachments []attachment) []attachment {
 		visible = append(visible, a)
 	}
 	return visible
+}
+
+// Messages stores rich preview data as hidden plugin payload attachments.
+func (a attachment) isPreviewPayload() bool {
+	for _, name := range [...]string{a.TransferName, a.Filename, a.OriginalPath} {
+		if strings.EqualFold(path.Ext(name), ".pluginPayloadAttachment") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a attachment) isPhoto() bool {

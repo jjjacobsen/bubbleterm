@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"time"
@@ -50,6 +51,7 @@ type actionFinished struct {
 
 type photoOpened struct{ err error }
 type videoFinished struct{ err error }
+type linkOpened struct{ err error }
 
 type photoPreview struct{ rows []string }
 
@@ -67,7 +69,8 @@ type catchUp struct{}
 
 type historyRow struct {
 	messageIndex    int // -1 for a date label
-	attachmentIndex int // -1 for message text
+	attachmentIndex int // -1 for message text or links
+	linkNumber      int // 1-based, zero for non-link rows
 	photoRow        int // 1 through previewHeight for thumbnail rows
 	text            string
 }
@@ -282,6 +285,10 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		if msg.err != nil {
 			m.actionErr = msg.err
 		}
+	case linkOpened:
+		if msg.err != nil {
+			m.actionErr = msg.err
+		}
 	case watchChanged:
 		m.reconnecting, m.watchErr = false, nil
 		return tea.Batch(m.waitForWatch(), m.refresh())
@@ -360,6 +367,14 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 			} else if a.isVideo() && !m.videoActive {
 				m.videoActive, m.actionErr = true, nil
 				return func() tea.Msg { return videoFinished{m.b.playVideo(a)} }
+			} else if link := m.selectedLink(); link != "" {
+				m.actionErr = nil
+				return func() tea.Msg {
+					if err := exec.Command("xdg-open", link).Run(); err != nil {
+						return linkOpened{fmt.Errorf("open link: %w", err)}
+					}
+					return linkOpened{}
+				}
 			}
 		case "o":
 			if m.moreHistory {
@@ -389,6 +404,9 @@ func (m *ui) selectedAttachment() attachment {
 		return attachment{}
 	}
 	row := m.rows[m.rowIndex]
+	if row.linkNumber > 0 {
+		return attachment{}
+	}
 	attachments := m.messages[row.messageIndex].Attachments
 	if row.attachmentIndex >= 0 {
 		return attachments[row.attachmentIndex]
@@ -400,6 +418,21 @@ func (m *ui) selectedAttachment() attachment {
 		}
 	}
 	return attachment{}
+}
+
+func (m *ui) selectedLink() string {
+	if len(m.rows) == 0 {
+		return ""
+	}
+	row := m.rows[m.rowIndex]
+	links := m.messages[row.messageIndex].Links
+	if row.linkNumber > 0 {
+		return links[row.linkNumber-1]
+	}
+	if row.attachmentIndex < 0 && len(links) == 1 {
+		return links[0]
+	}
+	return ""
 }
 
 func (m *ui) moveChat(key string) tea.Cmd {
@@ -489,9 +522,9 @@ func moveIndex(key string, index, size, page int) int {
 		index -= max(1, page-1)
 	case "pgdown":
 		index += max(1, page-1)
-	case "home":
+	case "home", "<":
 		index = 0
-	case "end":
+	case "end", ">":
 		index = size - 1
 	}
 	return min(max(0, index), max(0, size-1))
@@ -516,6 +549,37 @@ func historyDateLabel(at, now time.Time) string {
 	return date + " · " + at.Format("3:04 PM")
 }
 
+func historyLinkLabel(i, count int) string {
+	if count == 1 {
+		return "[Link]"
+	}
+	return fmt.Sprintf("[Link %d]", i+1)
+}
+
+func historyText(text string, links []string) string {
+	text = cleanText(text)
+	if strings.ContainsRune(text, '\ufffc') {
+		text = strings.TrimSpace(strings.ReplaceAll(text, "\ufffc", ""))
+	}
+	if len(links) == 0 {
+		return text
+	}
+	lines := slices.DeleteFunc(strings.Split(text, "\n"), func(line string) bool {
+		return slices.Contains(links, strings.TrimSpace(line))
+	})
+	// Replace shared URL prefixes in longest-first order.
+	order := make([]int, len(links))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortFunc(order, func(i, j int) int { return len(links[j]) - len(links[i]) })
+	var pairs []string
+	for _, i := range order {
+		pairs = append(pairs, links[i], historyLinkLabel(i, len(links)))
+	}
+	return strings.NewReplacer(pairs...).Replace(strings.TrimSpace(strings.Join(lines, "\n")))
+}
+
 func (m *ui) setHistory(messages []message) {
 	follow := m.rowIndex >= len(m.rows)-1
 	var old historyRow
@@ -523,7 +587,7 @@ func (m *ui) setHistory(messages []message) {
 	if !follow {
 		old = m.rows[m.rowIndex]
 		selectedID = m.messages[old.messageIndex].ID
-		if old.attachmentIndex < 0 {
+		if old.attachmentIndex < 0 && old.linkNumber == 0 {
 			for row := m.rowIndex - 1; row >= 0 && m.rows[row].messageIndex == old.messageIndex; row-- {
 				offset++
 			}
@@ -566,11 +630,8 @@ func (m *ui) setHistory(messages []message) {
 		if others := oneLine(item.OtherReactions); others != "" {
 			reaction += "[" + others + "] "
 		}
-		text := cleanText(item.Text)
-		if strings.ContainsRune(text, '\ufffc') {
-			text = strings.TrimSpace(strings.ReplaceAll(text, "\ufffc", ""))
-		}
-		if text == "" && len(item.Attachments) == 0 {
+		text := historyText(item.Text, item.Links)
+		if text == "" && len(item.Attachments) == 0 && len(item.Links) == 0 {
 			text = "[No text]"
 		}
 		if text != "" {
@@ -585,6 +646,17 @@ func (m *ui) setHistory(messages []message) {
 		restore := !follow && item.ID == selectedID
 		if restore {
 			selected = start + min(offset, max(0, len(m.rows)-start-1))
+		}
+		for j, link := range item.Links {
+			if restore && j+1 == old.linkNumber {
+				selected = len(m.rows)
+			}
+			label := historyLinkLabel(j, len(item.Links)) + " " + link
+			if sender != "" {
+				label = sender + ": " + label
+			}
+			m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: -1, linkNumber: j + 1, text: reaction + label})
+			sender, reaction = "", ""
 		}
 		photos, videos := 0, 0
 		for _, a := range item.Attachments {
@@ -779,7 +851,7 @@ func (m *ui) historyLine(row int) string {
 		return strings.Repeat(" ", (width-ansi.StringWidth(label))/2) + "\x1b[2m" + label + "\x1b[22m"
 	}
 	current := m.rows[m.rowIndex]
-	selected := m.focus != uiChats && line.messageIndex == current.messageIndex && line.attachmentIndex == current.attachmentIndex
+	selected := m.focus != uiChats && line.messageIndex == current.messageIndex && line.attachmentIndex == current.attachmentIndex && line.linkNumber == current.linkNumber
 	msg := m.messages[line.messageIndex]
 	mark := marker(selected)
 	content := ansi.Truncate(mark+line.text, width, "")
@@ -823,6 +895,8 @@ func (m *ui) footer() []string {
 			keys = "Enter Photo   " + keys
 		} else if a.isVideo() && !m.videoActive {
 			keys = "Enter Play   " + keys
+		} else if m.selectedLink() != "" {
+			keys = "Enter Link   " + keys
 		}
 		lines = append(lines, keys)
 	case uiCompose:

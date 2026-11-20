@@ -32,7 +32,9 @@ type message struct {
 	FromMe             bool         `json:"is_from_me"`
 	CreatedAt          time.Time    `json:"created_at"`
 	UnsentAt           *time.Time   `json:"unsent_at"`
+	BalloonBundleID    string       `json:"balloon_bundle_id"`
 	Attachments        []attachment `json:"attachments"`
+	Links              []string     `json:"-"`
 	MyReaction         string       `json:"-"`
 	OtherReactions     string       `json:"-"`
 	SelectedAttachment *attachment  `json:"-"`
@@ -231,6 +233,9 @@ func (b backend) history(id, limit int) ([]message, bool, error) {
 		}
 	}
 	if err := b.loadHistoryDetails(rows); err != nil {
+		return nil, false, err
+	}
+	if err := b.loadHistoryLinks(rows); err != nil {
 		return nil, false, err
 	}
 	slices.Reverse(rows)
