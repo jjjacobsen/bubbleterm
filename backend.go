@@ -1,0 +1,266 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+)
+
+type backend struct{ host string }
+
+type chat struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+type message struct {
+	ID     int    `json:"id"`
+	GUID   string `json:"guid"`
+	Text   string `json:"text"`
+	Sender string `json:"sender"`
+	FromMe bool   `json:"is_from_me"`
+}
+
+const imsgPath = "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH "
+const imsg = imsgPath + "exec imsg "
+
+// imsg can outlive a non-interactive SSH channel. Stop it when SSH stdin closes.
+const watchCommand = `exec 3<&0
+` + imsgPath + `imsg watch --reactions --json &
+watcher=$!
+( read -r ignored <&3; kill "$watcher" 2>/dev/null ) &
+monitor=$!
+wait "$watcher"
+status=$?
+kill "$monitor" 2>/dev/null
+exit "$status"`
+
+// Backend values for the same host share one session, even when the UI copies them.
+var backendSessions = struct {
+	sync.Mutex
+	byHost map[string]*sshSession
+}{byHost: make(map[string]*sshSession)}
+
+type sshSession struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	dir    string
+
+	mu      sync.Mutex
+	started bool
+}
+
+func (b backend) session() (*sshSession, error) {
+	backendSessions.Lock()
+	defer backendSessions.Unlock()
+	if s, ok := backendSessions.byHost[b.host]; ok {
+		if s == nil {
+			return nil, context.Canceled
+		}
+		return s, nil
+	}
+	// A short, private path keeps the control socket within the Unix socket limit.
+	dir, err := os.MkdirTemp("/tmp", "bubbleterm-")
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &sshSession{ctx: ctx, cancel: cancel, dir: dir}
+	backendSessions.byHost[b.host] = s
+	return s, nil
+}
+
+func (s *sshSession) ssh(ctx context.Context, opts ...string) *exec.Cmd {
+	args := []string{
+		"-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
+		"-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-S", s.dir + "/socket",
+	}
+	return exec.CommandContext(ctx, "ssh", append(args, opts...)...)
+}
+
+func (s *sshSession) start(host string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return nil
+	}
+	// Establish the master before parallel reads and watch can race to create it.
+	out, err := s.ssh(s.ctx, "-fN", "--", host).CombinedOutput()
+	if err != nil {
+		return remoteError("open SSH connection", err, out)
+	}
+	s.started = true
+	return nil
+}
+
+func (b backend) close() error {
+	backendSessions.Lock()
+	s := backendSessions.byHost[b.host]
+	backendSessions.byHost[b.host] = nil
+	backendSessions.Unlock()
+	if s == nil {
+		return nil
+	}
+	s.cancel()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var exitErr error
+	if _, err := os.Stat(s.dir + "/socket"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		out, err := s.ssh(ctx, "-O", "exit", "--", b.host).CombinedOutput()
+		if err != nil {
+			exitErr = remoteError("close SSH connection", err, out)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		exitErr = err
+	}
+	return errors.Join(exitErr, os.RemoveAll(s.dir))
+}
+
+func (b backend) open() (*sshSession, error) {
+	s, err := b.session()
+	if err != nil {
+		return nil, err
+	}
+	if err := s.start(b.host); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func remoteError(op string, err error, out []byte) error {
+	if detail := strings.TrimSpace(string(out)); detail != "" {
+		return fmt.Errorf("%s: %w: %s", op, err, detail)
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+func (b backend) run(op, remote string) ([]byte, error) {
+	s, err := b.open()
+	if err != nil {
+		return nil, err
+	}
+	cmd := s.ssh(s.ctx, "--", b.host, remote)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, remoteError(op, err, stderr.Bytes())
+	}
+	return out, nil
+}
+
+func readRows[T any](b backend, op, remote string) ([]T, error) {
+	out, err := b.run(op, imsg+remote)
+	if err != nil {
+		return nil, err
+	}
+	d := json.NewDecoder(bytes.NewReader(out))
+	var rows []T
+	for {
+		var row T
+		if err := d.Decode(&row); err == io.EOF {
+			return rows, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("decode %s: %w", op, err)
+		}
+		rows = append(rows, row)
+	}
+}
+
+func (b backend) chats() ([]chat, error) {
+	rows, err := readRows[struct {
+		chat
+		ContactName string `json:"contact_name"`
+	}](b, "list chats", "chats --limit 100 --json")
+	if err != nil {
+		return nil, err
+	}
+	chats := make([]chat, 0, len(rows))
+	for _, row := range rows {
+		if row.ContactName != "" {
+			row.Name = row.ContactName
+		}
+		chats = append(chats, row.chat)
+	}
+	return chats, nil
+}
+
+func (b backend) history(id, limit int) ([]message, bool, error) {
+	// imsg has no row cursor. The extra row tells us whether another page exists.
+	rows, err := readRows[message](b, "read history", fmt.Sprintf("history --chat-id %d --limit %d --json", id, limit+1))
+	more := len(rows) > limit
+	rows = rows[:min(len(rows), limit)]
+	slices.Reverse(rows)
+	return rows, more, err
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func (b backend) send(id int, text string) error {
+	_, err := b.run("send message", imsg+fmt.Sprintf("send --chat-id %d %s", id, shellQuote("--text="+text)))
+	return err
+}
+
+func (b backend) react(id int, m message, kind string) error {
+	_, err := b.run("react to message", fmt.Sprintf(`exec "$HOME/.local/bin/bubbleterm-react" %d %s %s`, id, shellQuote(m.GUID), shellQuote(kind)))
+	return err
+}
+
+// watch blocks until the stream stops or close cancels it.
+func (b backend) watch(notify func()) error {
+	s, err := b.open()
+	if err != nil {
+		return err
+	}
+	cmd := s.ssh(s.ctx, "--", b.host, watchCommand)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	defer stdin.Close()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start watch: %w", err)
+	}
+	d := json.NewDecoder(stdout)
+	var row struct{}
+	for {
+		if err := d.Decode(&row); err != nil {
+			if err != io.EOF {
+				_ = cmd.Process.Kill()
+			}
+			waitErr := cmd.Wait()
+			if s.ctx.Err() != nil {
+				return s.ctx.Err()
+			}
+			if err != io.EOF {
+				return fmt.Errorf("decode watch event: %w", err)
+			}
+			if waitErr != nil {
+				return remoteError("watch", waitErr, stderr.Bytes())
+			}
+			return io.EOF
+		}
+		notify()
+	}
+}
