@@ -14,12 +14,8 @@ shell.includeStandardAdditions = true;
 const bundle = 'com.apple.MobileSMS';
 const transcriptID = 'TranscriptCollectionView';
 const tapbacks = [
-    ['love', 'heart', 'Love', 'Heart', '❤️'],
-    ['like', 'thumbs_up', 'Like', 'Thumbs Up', '👍'],
-    ['dislike', 'thumbs_down', 'Dislike', 'Thumbs Down', '👎'],
-    ['laugh', 'ha_ha!', 'Laugh', 'Ha Ha', '😂'],
-    ['emphasis', 'exclamation_mark', 'Emphasize', 'Emphasis', '!!', '‼️'],
-    ['question', 'question_mark', 'Question', 'Question Mark', '?', '❓'],
+    ['love', 'heart'], ['like', 'thumbs_up'], ['dislike', 'thumbs_down'],
+    ['laugh', 'ha_ha!'], ['emphasis', 'exclamation_mark'], ['question', 'question_mark'],
 ];
 
 const sqlQuote = value => "'" + value.replace(/'/g, "''") + "'";
@@ -27,14 +23,40 @@ const shellQuote = value => "'" + value.replace(/'/g, "'\\''") + "'";
 
 function query(sql) {
     const path = ObjC.unwrap($.NSHomeDirectory()) + '/Library/Messages/chat.db';
-    const output = shell.doShellScript('/usr/bin/sqlite3 -batch -bail -readonly -init /dev/null -json ' +
-        shellQuote(path) + ' ' + shellQuote(sql), { alteringLineEndings: false });
-    return output ? JSON.parse(output) : [];
+    try {
+        const output = shell.doShellScript('/usr/bin/sqlite3 -batch -bail -readonly -init /dev/null -json ' +
+            shellQuote(path) + ' ' + shellQuote(sql), { alteringLineEndings: false });
+        return output ? JSON.parse(output) : [];
+    } catch (error) {
+        throw new Error('Cannot read the Messages database');
+    }
+}
+
+function messageText(row) {
+    if (row.text !== null) return row.text;
+    const body = row.body;
+    // Read the length-prefixed UTF-8 NSString in a typedstream attributed body.
+    const marker = /^040B73747265616D7479706564(?:[0-9A-F]{2}){0,100}?8484084E53537472696E67019[45]84012B/.exec(body);
+    if (!marker) throw new Error('Unsupported Messages body format');
+    let start = marker[0].length;
+    let length = parseInt(body.slice(start, start + 2), 16);
+    start += 2;
+    if (length === 0x81 || length === 0x82) {
+        const bytes = length === 0x81 ? 2 : 4;
+        length = 0;
+        for (let i = 0; i < bytes; i++, start += 2) {
+            length += parseInt(body.slice(start, start + 2), 16) * 256 ** i;
+        }
+    } else if (length > 0x7f) throw new Error('Unsupported Messages body length');
+    const end = start + 2 * length;
+    if (body.slice(end, end + 2) !== '86') throw new Error('Invalid Messages body length');
+    return decodeURIComponent(body.slice(start, end).replace(/../g, '%$&'));
 }
 
 function resolveTarget(chat, guid) {
     const rows = query(`
-        SELECT c.chat_identifier AS identifier, m.text
+        SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, m.is_from_me AS outgoing,
+               m.text, CASE WHEN m.text IS NULL THEN hex(m.attributedBody) END AS body
         FROM chat c
         JOIN chat_message_join j ON j.chat_id = c.ROWID
         JOIN message m ON m.ROWID = j.message_id
@@ -47,27 +69,26 @@ function resolveTarget(chat, guid) {
           AND NOT EXISTS (SELECT 1 FROM message_attachment_join WHERE message_id = m.ROWID)`);
     if (rows.length !== 1) throw new Error('No unambiguous plain-text target in that chat');
     const target = rows[0];
-    const text = target.text;
+    const text = messageText(target);
     if (!text || !text.trim() || /[\x00\ufffc\ufffd]/.test(text) || target.identifier.includes('\x00')) {
         throw new Error('The target has no usable plain text or chat identifier');
     }
 
-    // The transcript has no chat GUID. A matching balloon must identify this
-    // message across chats, even if Messages did not follow the requested URL.
-    // Typedstream stores the NSString body as UTF-8. Check matching blobs as
-    // well as legacy text, and do not guess when a candidate cannot be decoded.
+    // The selected chat is verified separately. Only matching messages in that chat can collide.
     const needle = sqlQuote(text);
     const duplicates = query(`
-        SELECT 1
-        FROM message m
-        WHERE m.guid COLLATE BINARY <> ${guid}
+        SELECT m.is_from_me AS outgoing, m.text,
+               CASE WHEN m.text IS NULL THEN hex(m.attributedBody) END AS body
+        FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
+        WHERE j.chat_id = ${chat} AND m.guid COLLATE BINARY <> ${guid}
           AND COALESCE(m.associated_message_type, 0) = 0
           AND (m.text COLLATE BINARY = ${needle}
-               OR (m.text IS NULL AND instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0))
-          AND EXISTS (SELECT 1 FROM chat_message_join WHERE message_id = m.ROWID)
-        LIMIT 1`);
-    if (duplicates.length) throw new Error('Target text is not unique in Messages');
-    return { identifier: target.identifier, text };
+               OR (m.text IS NULL AND instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0))`)
+        .filter(row => messageText(row) === text);
+    if (duplicates.some(row => row.outgoing === target.outgoing)) {
+        throw new Error('Target text is not unique for that sender direction in this chat');
+    }
+    return { ...target, text, ambiguousDirection: duplicates.length > 0 };
 }
 
 function attr(element, name) {
@@ -88,7 +109,7 @@ const identifier = element => value(element, 'AXIdentifier');
 
 function hasAction(element, name) {
     const result = Ref();
-    return $.AXUIElementCopyActionNames(element, result) === 0 && ObjC.unwrap(result[0]).includes(name);
+    return $.AXUIElementCopyActionNames(element, result) === 0 && ObjC.deepUnwrap(result[0]).includes(name);
 }
 
 function find(root, matches, prune = () => false) {
@@ -107,7 +128,7 @@ function waitFor(probe, seconds) {
     return null;
 }
 
-function findMenuItem(app, window, parent, labels) {
+function withMenuItem(app, window, parent, requireTarget, itemID, useItem) {
     const isMenu = el => role(el) === 'AXMenu';
     const menus = () => {
         const roots = [window, parent, ...children(app).filter(isMenu)];
@@ -121,37 +142,65 @@ function findMenuItem(app, window, parent, labels) {
         }
         const result = [];
         for (const root of roots) {
-            for (const menu of find(root, isMenu, el => identifier(el) === transcriptID)) {
+            for (const menu of find(root, isMenu, el => [transcriptID, 'ConversationList'].includes(identifier(el)))) {
                 if (!result.some(other => $.CFEqual(other, menu))) result.push(menu);
             }
         }
         return result;
     };
-    const previous = menus();
-    const status = $.AXUIElementPerformAction(parent, 'AXShowMenu');
-    // Showing a modal menu can time out while the menu is still open.
-    if (status !== 0 && status !== -25204) throw new Error('Cannot open the target menu (AX error ' + status + ')');
-    const item = waitFor(() => {
-        const opened = menus().filter(menu => !previous.some(other => $.CFEqual(other, menu)));
-        if (opened.length > 1) throw new Error('More than one menu opened');
-        if (!opened.length) return null;
-        const matches = find(opened[0], el => role(el) === 'AXMenuItem' &&
-            ['AXIdentifier', 'AXTitle', 'AXDescription'].some(key => labels.includes(value(el, key))));
-        if (matches.length > 1) throw new Error('More than one menu item matches the requested tapback');
-        return matches[0];
-    }, 2);
-    if (!item || !value(item, 'AXEnabled')) throw new Error('The requested tapback menu item is not available');
-    return item;
+    if (menus().length) throw new Error('Close the open Messages menu first');
+    requireTarget();
+    let menu;
+    try {
+        const status = $.AXUIElementPerformAction(parent, 'AXShowMenu');
+        // Showing a modal menu can time out while the menu is still open.
+        if (status !== 0 && status !== -25204) throw new Error('Cannot open the target menu (AX error ' + status + ')');
+        const item = waitFor(() => {
+            const opened = menus();
+            if (opened.length > 1) throw new Error('More than one menu opened');
+            if (!opened.length) return null;
+            menu = opened[0];
+            const matches = find(menu, el => role(el) === 'AXMenuItem' && identifier(el) === itemID);
+            if (matches.length > 1) throw new Error('More than one menu item matches the requested tapback');
+            return matches[0];
+        }, 2);
+        if (!item || !value(item, 'AXEnabled') || !hasAction(item, 'AXPress')) {
+            throw new Error('The requested tapback menu item is not available');
+        }
+        requireTarget();
+        return useItem(item);
+    } finally {
+        const open = () => menus().find(el => !menu || $.CFEqual(el, menu));
+        const opened = open();
+        if (opened) {
+            $.AXUIElementPerformAction(opened, 'AXCancel');
+            if (!waitFor(() => !open(), 2)) throw new Error('Cannot close the Messages menu');
+        }
+    }
 }
 
-function selectMenuItem(target, labels) {
+function horizontalBounds(element) {
+    const frame = attr(element, 'AXFrame');
+    const match = frame && /value = x:(-?[\d.]+) y:-?[\d.]+ w:([\d.]+) h:/.exec(ObjC.unwrap(frame.description));
+    if (!match) throw new Error('Cannot read the Messages balloon position');
+    return [Number(match[1]), Number(match[1]) + Number(match[2])];
+}
+
+function withTargetMenu(target, itemID, check, useItem) {
     if (!$.AXIsProcessTrusted()) throw new Error('Grant Accessibility access to the process that runs this helper');
-    const url = 'sms://open?groupid=' + encodeURIComponent(target.identifier);
-    shell.doShellScript('/usr/bin/open -b ' + bundle + ' ' + shellQuote(url));
+    // Messages stores the selected sidebar row as list-<chat GUID>.
+    const selected = () => shell.doShellScript('/usr/bin/defaults read ' + bundle +
+        ' CKLastSelectedItemIdentifier 2>/dev/null || true') === 'list-' + target.chatGUID;
+    // Do not open a chat in check mode, since that can mark messages as read.
+    if (check && !selected()) throw new Error('Select the target chat in Messages before running --check');
+    if (!check) {
+        const url = 'sms://open?groupid=' + encodeURIComponent(target.identifier);
+        shell.doShellScript('/usr/bin/open -b ' + bundle + ' ' + shellQuote(url) + ' 2>/dev/null');
+    }
 
     const running = waitFor(() => {
         const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(bundle);
-        return apps.count === 1 && apps.firstObject.isActive && apps.firstObject;
+        return Number(apps.count) === 1 && apps.firstObject.isActive && apps.firstObject;
     }, 5);
     if (!running) throw new Error('Messages is not in front');
     const app = $.AXUIElementCreateApplication(running.processIdentifier);
@@ -159,8 +208,10 @@ function selectMenuItem(target, labels) {
     if (timeoutStatus !== 0) throw new Error('Cannot set the Messages AX timeout (AX error ' + timeoutStatus + ')');
     const focusedWindow = () => {
         if (!running.isActive) throw new Error('Messages lost focus');
+        if (!selected()) return null;
+        const windows = (value(app, 'AXWindows') || []).filter(el => value(el, 'AXSubrole') === 'AXStandardWindow');
         const window = attr(app, 'AXFocusedWindow');
-        return window && value(window, 'AXSubrole') === 'AXStandardWindow' ? window : null;
+        return windows.length === 1 && window && $.CFEqual(window, windows[0]) ? window : null;
     };
     const transcript = () => {
         const window = focusedWindow();
@@ -171,11 +222,20 @@ function selectMenuItem(target, labels) {
     };
 
     let current = waitFor(transcript, 3);
-    if (!current) throw new Error('No Messages transcript is open');
+    if (!current) throw new Error('Cannot verify the selected Messages transcript');
     for (let page = 0; page <= 3; page++) {
         const visible = value(current.view, 'AXVisibleChildren') || children(current.view);
         const matches = visible.flatMap(child => find(child, el => identifier(el) === 'CKBalloonTextView' &&
-            value(el, 'AXValue') === target.text));
+            value(el, 'AXValue') === target.text)).filter(balloon => {
+            if (!target.ambiguousDirection) return true;
+            // Self chats can display a sent and a received copy of the same text.
+            const [left, right] = horizontalBounds(current.view);
+            const [start, end] = horizontalBounds(balloon);
+            const middle = (left + right) / 2;
+            if (start > middle) return target.outgoing === 1;
+            if (end < middle) return target.outgoing === 0;
+            throw new Error('Cannot distinguish the sender direction of a matching balloon');
+        });
         if (matches.length > 1) throw new Error('More than one balloon matches the target text');
         if (matches.length === 1) {
             const parent = attr(matches[0], 'AXParent');
@@ -183,12 +243,11 @@ function selectMenuItem(target, labels) {
             if (!window || !$.CFEqual(window, current.window) || !parent || !hasAction(parent, 'AXShowMenu')) {
                 throw new Error('Cannot open the exact target balloon menu');
             }
-            const item = findMenuItem(app, window, parent, labels);
-            return { item, requireFocus: () => {
+            return withMenuItem(app, window, parent, () => {
                 const focused = focusedWindow();
-                if (!focused || !$.CFEqual(focused, window)) throw new Error('Messages switched windows');
+                if (!focused || !$.CFEqual(focused, window)) throw new Error('Messages switched chats or windows');
                 if (value(matches[0], 'AXValue') !== target.text) throw new Error('The target balloon changed');
-            } };
+            }, itemID, useItem);
         }
         if (page === 3) break;
         const scroll = 'AXScrollUpByPage';
@@ -203,13 +262,17 @@ function selectMenuItem(target, labels) {
 }
 
 function run(args) {
+    const check = args[0] === '--check';
+    if (check) args = args.slice(1);
     const [chat, guid, kind] = args;
     const reaction = tapbacks.findIndex(entry => entry[0] === kind);
     if (args.length !== 3 || !/^[1-9][0-9]{0,18}$/.test(chat) ||
         (chat.length === 19 && chat > '9223372036854775807') || !guid || reaction < 0) {
-        throw new Error('Usage: bubbleterm-react CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question');
+        throw new Error('Usage: bubbleterm-react [--check] CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question');
     }
     const target = resolveTarget(chat, sqlQuote(guid));
+    const itemID = tapbacks[reaction][1];
+    if (check) return withTargetMenu(target, itemID, true, () => 'Tapback target verified. No reaction sent.');
     const type = 2000 + reaction;
     const events = (after = 0) => query(`
         SELECT m.guid, m.associated_message_guid AS target, m.associated_message_type AS type
@@ -228,21 +291,21 @@ function run(args) {
     }
     if (active && active.type === type) return active.guid;
 
-    const { item, requireFocus } = selectMenuItem(target, tapbacks[reaction].slice(1));
     const after = query('SELECT CAST(COALESCE(max(ROWID), 0) AS TEXT) AS id FROM message')[0].id;
-    requireFocus();
-    // Never press again: even a failed AX call can have applied the tapback.
-    try {
-        const status = $.AXUIElementPerformAction(item, 'AXPress');
-        const recorded = waitFor(() => {
-            const added = events(after).filter(row => row.type < 3000);
-            if (added.length > 1) throw new Error('More than one tapback was added to the target');
-            return added.length && added[0].type === type && added[0].guid;
-        }, 5);
-        if (recorded) return recorded;
-        throw new Error('No matching outgoing tapback was recorded (AX result ' + status + ')');
-    } catch (error) {
-        throw new Error(error.message + '. Check Messages before retrying');
-    }
+    return withTargetMenu(target, itemID, false, item => {
+        // Never press again: even a failed AX call can have applied the tapback.
+        try {
+            const status = $.AXUIElementPerformAction(item, 'AXPress');
+            const recorded = waitFor(() => {
+                const added = events(after).filter(row => row.type < 3000);
+                if (added.length > 1) throw new Error('More than one tapback was added to the target');
+                return added.length && added[0].type === type && added[0].guid;
+            }, 5);
+            if (recorded) return recorded;
+            throw new Error('No matching outgoing tapback was recorded (AX result ' + status + ')');
+        } catch (error) {
+            throw new Error(error.message + '. Check Messages before retrying');
+        }
+    });
 }
 JXA
