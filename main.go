@@ -78,6 +78,7 @@ type historyRow struct {
 	attachmentIndex int // -1 for message text or links
 	linkNumber      int // 1-based, zero for non-link rows
 	photoRow        int // 1 through previewHeight for thumbnail rows
+	searchStart     int // byte offset in the unwrapped history search block
 	text            string
 }
 
@@ -99,7 +100,9 @@ type ui struct {
 	pinnedCount, chatIndex, chatTop int
 	messages                        []message
 	rows                            []historyRow
+	historySearch                   []historySearchBlock
 	rowIndex, rowTop                int
+	search                          *paneSearch
 	drafts                          map[draftKey][]rune
 	composeDraft                    draftKey
 	draftCursor                     int
@@ -142,7 +145,7 @@ func runUI(b *backend) error {
 		case tea.QuitMsg, tea.InterruptMsg:
 			g.close()
 		}
-		return clipboardKey(msg)
+		return terminalKey(msg)
 	})).Run()
 	return err
 }
@@ -211,7 +214,10 @@ func (m *ui) refresh() tea.Cmd {
 }
 
 func (m *ui) resetHistory() tea.Cmd {
-	m.messages, m.rows = nil, nil
+	m.messages, m.rows, m.historySearch = nil, nil, nil
+	if m.focus == uiHistory {
+		m.search = nil
+	}
 	clear(m.previews)
 	m.historyLimit, m.moreHistory = historyPageSize, false
 	m.rowIndex, m.rowTop, m.historyErr = 0, 0, nil
@@ -225,8 +231,11 @@ func (m *ui) resetHistory() tea.Cmd {
 }
 
 func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if key, ok := msg.(tea.KeyMsg); ok && (key.String() == "ctrl+c" || (key.String() == "q" && m.focus != uiCompose)) {
-		return m, tea.Quit
+	if k, ok := msg.(tea.KeyMsg); ok {
+		key := k.String()
+		if key == "ctrl+c" || (key == "q" && m.focus != uiCompose && m.search == nil) {
+			return m, tea.Quit
+		}
 	}
 	cmd := m.update(msg)
 	m.keepSelectionVisible()
@@ -241,12 +250,18 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.setHistory(m.messages)
+		if m.search != nil && m.focus == uiHistory {
+			m.updateSearch()
+		}
 	case chatsLoaded:
 		m.chatsBusy, m.chatsErr = false, msg.err
 		var history, again tea.Cmd
 		if msg.err == nil {
 			m.latestChats = msg.chats
 			history = m.orderChats()
+			if m.search != nil && m.focus == uiChats {
+				m.updateSearch()
+			}
 		}
 		if m.chatsAgain {
 			again = m.loadChats()
@@ -267,6 +282,9 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 					}
 				}
 				m.setHistory(messages)
+				if m.search != nil && m.focus == uiHistory {
+					m.updateSearch()
+				}
 			}
 		}
 		if m.historyAgain {
@@ -296,7 +314,7 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 			m.actionErr = msg.err
 		}
 	case shiftEnterMsg:
-		if m.focus == uiHistory {
+		if m.focus == uiHistory && m.search == nil {
 			return m.copy(m.selectedLink())
 		}
 	case watchChanged:
@@ -329,7 +347,14 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 }
 
 func (m *ui) key(k tea.KeyMsg) tea.Cmd {
+	if m.search != nil {
+		return m.searchKey(k)
+	}
 	key := k.String()
+	if key == "/" && (m.focus == uiChats || m.focus == uiHistory) {
+		m.startSearch()
+		return nil
+	}
 	if key == "ctrl+r" {
 		return m.refresh()
 	}
@@ -724,6 +749,7 @@ func (m *ui) setHistory(messages []message) {
 	width := max(1, m.historyWidth()-2)
 	thumbnails := m.thumbnailSpace()
 	m.messages, m.rows = messages, m.rows[:0]
+	m.historySearch = m.historySearch[:0]
 	selected := -1
 	now := time.Now()
 	isGroup := len(m.chats) > 0 && m.chats[m.chatIndex].IsGroup
@@ -767,16 +793,16 @@ func (m *ui) setHistory(messages []message) {
 			reaction += "[" + others + "] "
 		}
 		text := historyText(item.Text, item.Links)
+		searchable := text != "" && !(item.UnsentAt != nil && text == "[Unsent message]")
 		if text == "" && len(item.Attachments) == 0 && len(item.Links) == 0 {
 			text = "[No text]"
 		}
 		if text != "" {
+			prefix := reaction
 			if sender != "" {
-				text = sender + ": " + text
+				prefix += sender + ": "
 			}
-			for _, line := range strings.Split(ansi.Wrap(reaction+text, width, ""), "\n") {
-				m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: -1, text: line})
-			}
+			m.appendHistoryText(i, prefix, text, width, searchable)
 			sender, reaction = "", ""
 		}
 		restore := !follow && item.ID == selectedID
@@ -787,11 +813,15 @@ func (m *ui) setHistory(messages []message) {
 			if restore && j+1 == old.linkNumber {
 				selected = len(m.rows)
 			}
-			label := historyLinkLabel(j, len(item.Links)) + " " + link
+			prefix := reaction
 			if sender != "" {
-				label = sender + ": " + label
+				prefix += sender + ": "
 			}
-			m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: -1, linkNumber: j + 1, text: reaction + label})
+			prefix += historyLinkLabel(j, len(item.Links)) + " "
+			text := prefix + link
+			row := len(m.rows)
+			m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: -1, linkNumber: j + 1, text: text})
+			m.historySearch = append(m.historySearch, historySearchBlock{text, len(prefix), row, row + 1})
 			sender, reaction = "", ""
 		}
 		photos, videos := 0, 0
@@ -847,11 +877,32 @@ func (m *ui) setHistory(messages []message) {
 	}
 }
 
+func (m *ui) appendHistoryText(index int, prefix, text string, width int, searchable bool) {
+	source := prefix + text
+	first, offset := len(m.rows), 0
+	for _, line := range strings.Split(ansi.Wrap(source, width, ""), "\n") {
+		// Wrapping can discard space at line boundaries. Locate each displayed fragment in order.
+		start := strings.Index(source[offset:], line)
+		if start >= 0 {
+			start += offset
+			offset = start + len(line)
+		}
+		m.rows = append(m.rows, historyRow{messageIndex: index, attachmentIndex: -1, text: line, searchStart: start})
+	}
+	if searchable {
+		m.historySearch = append(m.historySearch, historySearchBlock{source, len(prefix), first, len(m.rows)})
+	}
+}
+
 func (m *ui) thumbnailSpace() bool {
 	return m.g.supported && m.historyWidth() >= previewWidth+2 && m.height >= previewHeight+4
 }
 
 func (m *ui) loadPreviews() tea.Cmd {
+	// Leave the existing thumbnail cache in place while previewing search hits.
+	if m.search != nil {
+		return nil
+	}
 	if !m.thumbnailSpace() || (m.sidebarWidth() == 0 && m.focus == uiChats) {
 		clear(m.previews)
 		return nil
@@ -911,13 +962,18 @@ func (m *ui) chatRow(index int) int {
 	return index + 2
 }
 
+func (m *ui) scrollChats(top, index, height int) int {
+	row := m.chatRow(index)
+	top = scrollTop(top, row, height, m.chatRow(len(m.chats)-1)+1)
+	if height > 1 && m.pinnedCount > 0 && top == row && (index == 0 || index == m.pinnedCount) {
+		top--
+	}
+	return top
+}
+
 func (m *ui) keepSelectionVisible() {
 	height := max(1, m.bodyHeight())
-	selectedChatRow := m.chatRow(m.chatIndex)
-	m.chatTop = scrollTop(m.chatTop, selectedChatRow, height, m.chatRow(len(m.chats)-1)+1)
-	if height > 1 && m.pinnedCount > 0 && m.chatTop == selectedChatRow && (m.chatIndex == 0 || m.chatIndex == m.pinnedCount) {
-		m.chatTop--
-	}
+	m.chatTop = m.scrollChats(m.chatTop, m.chatIndex, height)
 	m.rowTop = scrollTop(m.rowTop, m.rowIndex, height, len(m.rows))
 	if len(m.rows) > 0 {
 		start := m.rowIndex - m.rows[m.rowIndex].photoRow
@@ -929,6 +985,9 @@ func (m *ui) keepSelectionVisible() {
 		if start > 0 && m.rowTop == start && m.rows[start-1].messageIndex < 0 && end-start+2 <= height {
 			m.rowTop--
 		}
+	}
+	if m.search != nil {
+		m.keepSearchVisible(height)
 	}
 }
 
@@ -976,7 +1035,11 @@ func (m *ui) chatLine(row int) string {
 		}
 		return "No chats"
 	}
-	index := m.chatTop + row
+	selected, top := m.chatIndex, m.chatTop
+	if m.focus == uiChats {
+		selected, top = m.searchSelection(selected, top)
+	}
+	index := top + row
 	if m.pinnedCount > 0 {
 		if index == 0 {
 			return "\x1b[2mPinned\x1b[22m"
@@ -992,7 +1055,18 @@ func (m *ui) chatLine(row int) string {
 	if index >= len(m.chats) {
 		return ""
 	}
-	return marker(index == m.chatIndex) + chatName(m.chats[index])
+	name := chatName(m.chats[index])
+	mark := marker(index == selected)
+	if m.search != nil && m.focus == uiChats {
+		if label, ok := m.search.chatLabels[index]; ok {
+			width := m.sidebarWidth()
+			if width == 0 {
+				width = m.width
+			}
+			name = m.search.highlight(index, label, width-len(mark))
+		}
+	}
+	return mark + name
 }
 
 func (m *ui) historyLine(row int) string {
@@ -1003,7 +1077,11 @@ func (m *ui) historyLine(row int) string {
 		}
 		return ansi.Truncate("No messages", width, "")
 	}
-	index := m.rowTop + row
+	selectedRow, top := m.rowIndex, m.rowTop
+	if m.focus == uiHistory {
+		selectedRow, top = m.searchSelection(selectedRow, top)
+	}
+	index := top + row
 	if index >= len(m.rows) {
 		return ""
 	}
@@ -1012,11 +1090,16 @@ func (m *ui) historyLine(row int) string {
 		label := ansi.Truncate(line.text, width, "")
 		return strings.Repeat(" ", (width-ansi.StringWidth(label))/2) + "\x1b[2m" + label + "\x1b[22m"
 	}
-	current := m.rows[m.rowIndex]
+	current := m.rows[selectedRow]
 	selected := m.focus != uiChats && line.messageIndex == current.messageIndex && line.attachmentIndex == current.attachmentIndex && line.linkNumber == current.linkNumber
 	msg := m.messages[line.messageIndex]
 	mark := marker(selected)
-	content := ansi.Truncate(mark+line.text, width, "")
+	var content string
+	if m.search != nil && m.focus == uiHistory && width > len(mark) {
+		content = mark + m.search.highlight(index, line.text, width-len(mark))
+	} else {
+		content = ansi.Truncate(mark+line.text, width, "")
+	}
 	cells := ansi.StringWidth(content)
 	if line.photoRow > 0 {
 		// Count placeholder cells without changing the graphics escapes.
@@ -1044,11 +1127,13 @@ func (m *ui) footer() []string {
 		return nil
 	}
 	var lines []string
-	switch m.focus {
-	case uiChats:
-		lines = append(lines, "Enter Open   p Pin/Unpin   ↑↓ Select   q Quit")
-	case uiHistory:
-		keys := "R Reply   c Copy   r React   i Compose   Esc Chats"
+	switch {
+	case m.search != nil:
+		lines = append(lines, m.search.prompt(m.width))
+	case m.focus == uiChats:
+		lines = append(lines, "Enter Open   / Search   p Pin/Unpin   ↑↓ Select   q Quit")
+	case m.focus == uiHistory:
+		keys := "/ Search   R Reply   c Copy   r React   i Compose   Esc Chats"
 		if m.moreHistory {
 			keys = "o Older   " + keys
 		}
@@ -1061,7 +1146,7 @@ func (m *ui) footer() []string {
 			keys = "Enter Open Link   Shift+Enter Copy Link   " + keys
 		}
 		lines = append(lines, keys)
-	case uiCompose:
+	case m.focus == uiCompose:
 		if m.composeDraft.guid != "" && m.height >= 4 {
 			lines = append(lines, "Reply to "+m.replyContext)
 		}
@@ -1070,7 +1155,7 @@ func (m *ui) footer() []string {
 		after := strings.ReplaceAll(string(draft[m.draftCursor:]), "\n", "↵")
 		before = ansi.TruncateLeft(before, max(0, ansi.StringWidth(before)-max(0, m.width-3)), "")
 		lines = append(lines, "> "+before+"▏"+after, "Enter Send   Esc Back")
-	case uiReact:
+	case m.focus == uiReact:
 		lines = strings.Split(ansi.Wrap("1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
 	}
 	if status := m.status(); status != "" {
@@ -1114,6 +1199,9 @@ func pad(s string, width int) string {
 }
 
 func chatName(c chat) string {
+	if name := oneLine(c.ContactName); name != "" {
+		return name
+	}
 	if name := oneLine(c.Name); name != "" {
 		return name
 	}

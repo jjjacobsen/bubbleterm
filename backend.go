@@ -18,9 +18,11 @@ import (
 type backend struct{ host string }
 
 type chat struct {
-	ID      int    `json:"id"`
-	Name    string `json:"name"`
-	IsGroup bool   `json:"is_group"`
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	IsGroup     bool   `json:"is_group"`
+	ContactName string `json:"contact_name,omitempty"`
+	Identifier  string `json:"identifier,omitempty"`
 }
 
 type message struct {
@@ -199,21 +201,7 @@ func readRows[T any](b backend, op, remote string) ([]T, error) {
 }
 
 func (b backend) chats() ([]chat, error) {
-	rows, err := readRows[struct {
-		chat
-		ContactName string `json:"contact_name"`
-	}](b, "list chats", "chats --limit 100 --json")
-	if err != nil {
-		return nil, err
-	}
-	chats := make([]chat, 0, len(rows))
-	for _, row := range rows {
-		if row.ContactName != "" {
-			row.Name = row.ContactName
-		}
-		chats = append(chats, row.chat)
-	}
-	return chats, nil
+	return readRows[chat](b, "list chats", "chats --limit 100 --json")
 }
 
 func (b backend) history(id, limit int) ([]message, bool, error) {

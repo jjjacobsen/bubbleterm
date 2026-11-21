@@ -49,14 +49,23 @@ func clipboardMessage(m message) string {
 
 type shiftEnterMsg struct{}
 
-// Call from tea.WithFilter. Omarchy Ghostty binds Shift+Enter to CSI 13;2u.
-// Bubble Tea v1 exposes this as an unexported CSI message, not a KeyMsg.
-func clipboardKey(msg tea.Msg) tea.Msg {
+// Bubble Tea already distinguishes legacy CR (Enter) and LF (Ctrl+J).
+// It exposes CSI-u keys, including Ghostty's Shift+Enter binding, as unknown CSI messages.
+func terminalKey(msg tea.Msg) tea.Msg {
 	if _, ok := msg.(tea.KeyMsg); ok {
 		return msg
 	}
-	if seq, ok := msg.(fmt.Stringer); ok && seq.String() == "?CSI[49 51 59 50 117]?" {
-		return shiftEnterMsg{}
+	if seq, ok := msg.(fmt.Stringer); ok {
+		switch seq.String() {
+		case "?CSI[49 51 117]?", "?CSI[49 51 59 49 117]?": // 13u, 13;1u
+			return tea.KeyMsg{Type: tea.KeyEnter}
+		case "?CSI[49 51 59 50 117]?": // 13;2u
+			return shiftEnterMsg{}
+		case "?CSI[49 48 54 59 53 117]?": // 106;5u
+			return tea.KeyMsg{Type: tea.KeyCtrlJ}
+		case "?CSI[49 48 55 59 53 117]?": // 107;5u
+			return tea.KeyMsg{Type: tea.KeyCtrlK}
+		}
 	}
 	return msg
 }
