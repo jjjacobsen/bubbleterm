@@ -272,7 +272,7 @@ func (b backend) react(id int, m message, kind string) error {
 }
 
 // watch blocks until the stream stops or close cancels it.
-func (b backend) watch(notify func()) error {
+func (b backend) watch(refresh func(), onEvent func(context.Context, json.RawMessage)) error {
 	s, err := b.open()
 	if err != nil {
 		return err
@@ -293,7 +293,7 @@ func (b backend) watch(notify func()) error {
 		return fmt.Errorf("start watch: %w", err)
 	}
 	d := json.NewDecoder(stdout)
-	var row struct{}
+	var row json.RawMessage
 	for {
 		if err := d.Decode(&row); err != nil {
 			if err != io.EOF {
@@ -311,6 +311,9 @@ func (b backend) watch(notify func()) error {
 			}
 			return io.EOF
 		}
-		notify()
+		refresh()
+		if onEvent != nil {
+			onEvent(s.ctx, row)
+		}
 	}
 }

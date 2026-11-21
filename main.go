@@ -184,6 +184,7 @@ type ui struct {
 	videoActive                     bool
 	chatsErr, historyErr, actionErr error
 	watchErr                        error
+	notifications                   desktopNotifications
 }
 
 func main() {
@@ -247,7 +248,7 @@ func (m *ui) watch() tea.Cmd {
 			case m.events <- struct{}{}:
 			default:
 			}
-		})}
+		}, m.notifications.onWatch())}
 	}
 }
 
@@ -457,6 +458,9 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 			m.actionErr = msg.err
 		}
 	case shiftEnterMsg:
+		if m.focus == uiCompose {
+			return m.compose(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'\n'}})
+		}
 		if m.focus == uiHistory && m.search == nil {
 			return m.copy(m.selectedLink())
 		}
@@ -1399,6 +1403,7 @@ func (m *ui) footer() []string {
 	if m.width < 1 || m.height < 2 {
 		return nil
 	}
+	limit := max(1, m.height-2)
 	var lines []string
 	switch {
 	case m.search != nil:
@@ -1427,32 +1432,64 @@ func (m *ui) footer() []string {
 		}
 		lines = append(lines, keys)
 	case m.focus == uiCompose:
-		if m.composeDraft.guid != "" && m.height >= 4 {
-			lines = append(lines, "Reply to "+m.replyContext)
-		}
-		draft := m.drafts[m.composeDraft]
-		prefix := "> "
-		keys := "Enter Send   Esc Back   Ctrl+V Paste"
-		if m.composeDraft.guid == "" {
-			keys += "   Ctrl+O Attach"
-		}
-		if draft.file != nil {
-			lines = append(lines, "Ctrl+X Remove: "+oneLine(draft.file.Name))
-			prefix = "Caption> "
-		}
-		before := strings.ReplaceAll(string(draft.text[:draft.cursor]), "\n", "↵")
-		after := strings.ReplaceAll(string(draft.text[draft.cursor:]), "\n", "↵")
-		before = ansi.TruncateLeft(before, max(0, ansi.StringWidth(before)-max(0, m.width-len(prefix)-1)), "")
-		lines = append(lines, prefix+before+"▏"+after)
-		lines = append(lines, strings.Split(ansi.Wrap(keys, m.width, ""), "\n")...)
+		return m.composeFooter(limit)
 	case m.focus == uiReact:
 		lines = strings.Split(ansi.Wrap("1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
 	}
-	limit := max(1, m.height-2)
 	if status := m.status(); status != "" {
 		lines = append(lines[:min(len(lines), limit-1)], status)
 	}
 	return lines[:min(len(lines), limit)]
+}
+
+func (m *ui) composeFooter(limit int) []string {
+	draft := m.drafts[m.composeDraft]
+	status := m.status()
+	if limit == 1 {
+		status = ""
+	} else if status != "" {
+		limit--
+	}
+	var lines []string
+	if limit > 1 {
+		if m.composeDraft.guid != "" {
+			lines = append(lines, "Reply to "+m.replyContext)
+		} else if draft.file != nil {
+			lines = append(lines, "Ctrl+X Remove: "+oneLine(draft.file.Name))
+		}
+	}
+	prefix := "> "
+	if draft.file != nil {
+		prefix = "Caption> "
+	}
+	if m.width <= len(prefix) {
+		prefix = ""
+	}
+	const maxDraftLines = 5
+	draftHeight := min(maxDraftLines, max(1, limit-len(lines)-1))
+	lines = append(lines, draft.visibleLines(prefix, m.width, draftHeight)...)
+	if len(lines) < limit {
+		keys := "Enter Send   Shift+Enter New Line   Esc Back   Ctrl+V Paste"
+		if m.composeDraft.guid == "" {
+			keys += "   Ctrl+O Attach"
+		}
+		help := strings.Split(ansi.Wrap(keys, m.width, ""), "\n")
+		lines = append(lines, help[:min(len(help), limit-len(lines))]...)
+	}
+	if status != "" {
+		lines = append(lines, status)
+	}
+	return lines
+}
+
+func (d *messageDraft) visibleLines(prefix string, width, limit int) []string {
+	before := prefix + string(d.text[:d.cursor]) + "▏"
+	lines := strings.Split(ansi.Hardwrap(before, width, true), "\n")
+	cursorRow := len(lines) - 1
+	tail := ansi.Hardwrap(lines[cursorRow]+string(d.text[d.cursor:]), width, true)
+	lines = append(lines[:cursorRow], strings.Split(tail, "\n")...)
+	top := scrollTop(0, cursorRow, limit, len(lines))
+	return lines[top:min(top+limit, len(lines))]
 }
 
 func (m *ui) status() string {
