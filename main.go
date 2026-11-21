@@ -43,15 +43,21 @@ type historyLoaded struct {
 	err       error
 }
 
+type draftKey struct {
+	chatID int
+	guid   string
+}
+
 type actionFinished struct {
-	id   int
-	text string
-	err  error
+	draft draftKey
+	text  string
+	err   error
 }
 
 type photoOpened struct{ err error }
 type videoFinished struct{ err error }
 type linkOpened struct{ err error }
+type clipboardCopied struct{ err error }
 
 type photoPreview struct{ rows []string }
 
@@ -88,13 +94,16 @@ type ui struct {
 
 	width, height                   int
 	focus                           int
-	chats                           []chat
-	chatIndex, chatTop              int
+	pins                            *pins
+	latestChats, chats              []chat
+	pinnedCount, chatIndex, chatTop int
 	messages                        []message
 	rows                            []historyRow
 	rowIndex, rowTop                int
-	drafts                          map[int][]rune
+	drafts                          map[draftKey][]rune
+	composeDraft                    draftKey
 	draftCursor                     int
+	replyContext                    string
 	target                          message
 	chatsBusy, chatsAgain           bool
 	historyBusy, historyAgain       bool
@@ -117,19 +126,23 @@ func main() {
 }
 
 func runUI(b *backend) error {
+	p, err := newPins(b.host)
+	if err != nil {
+		return fmt.Errorf("load pinned chats: %w", err)
+	}
 	done := make(chan struct{})
 	defer close(done)
 	g := newGraphics()
 	defer g.close()
-	m := &ui{b: b, g: g, events: make(chan struct{}, 1), done: done, drafts: make(map[int][]rune)}
+	m := &ui{b: b, g: g, events: make(chan struct{}, 1), done: done, pins: p, drafts: make(map[draftKey][]rune)}
 	m.accents = make(chan themeAccent)
 	go watchAccent(done, m.accents)
-	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(func(_ tea.Model, msg tea.Msg) tea.Msg {
+	_, err = tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(func(_ tea.Model, msg tea.Msg) tea.Msg {
 		switch msg.(type) {
 		case tea.QuitMsg, tea.InterruptMsg:
 			g.close()
 		}
-		return msg
+		return clipboardKey(msg)
 	})).Run()
 	return err
 }
@@ -232,19 +245,8 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		m.chatsBusy, m.chatsErr = false, msg.err
 		var history, again tea.Cmd
 		if msg.err == nil {
-			hadChat := len(m.chats) > 0
-			var id int
-			if hadChat {
-				id = m.chats[m.chatIndex].ID
-			}
-			m.chats = msg.chats
-			index := slices.IndexFunc(m.chats, func(c chat) bool { return hadChat && c.ID == id })
-			if index < 0 {
-				m.chatIndex = min(m.chatIndex, max(0, len(m.chats)-1))
-				history = m.resetHistory()
-			} else {
-				m.chatIndex = index
-			}
+			m.latestChats = msg.chats
+			history = m.orderChats()
 		}
 		if m.chatsAgain {
 			again = m.loadChats()
@@ -289,6 +291,14 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		if msg.err != nil {
 			m.actionErr = msg.err
 		}
+	case clipboardCopied:
+		if msg.err != nil {
+			m.actionErr = msg.err
+		}
+	case shiftEnterMsg:
+		if m.focus == uiHistory {
+			return m.copy(m.selectedLink())
+		}
 	case watchChanged:
 		m.reconnecting, m.watchErr = false, nil
 		return tea.Batch(m.waitForWatch(), m.refresh())
@@ -305,9 +315,9 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		if msg.err != nil {
 			return nil
 		}
-		if msg.text != "" && string(m.drafts[msg.id]) == msg.text {
-			delete(m.drafts, msg.id)
-			if len(m.chats) > 0 && m.chats[m.chatIndex].ID == msg.id {
+		if msg.text != "" && string(m.drafts[msg.draft]) == msg.text {
+			delete(m.drafts, msg.draft)
+			if m.focus == uiCompose && m.composeDraft == msg.draft {
 				m.draftCursor = 0
 			}
 		}
@@ -332,14 +342,14 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 	}
 	switch m.focus {
 	case uiCompose:
-		return m.compose(id, k)
+		return m.compose(k)
 	case uiReact:
 		if key == "esc" {
 			m.focus = uiHistory
 		} else if !m.writing && len(key) == 1 && key[0] >= '1' && key[0] <= '6' {
 			target, kind := m.target, tapbacks[key[0]-'1']
 			m.focus, m.writing, m.actionErr = uiHistory, true, nil
-			return func() tea.Msg { return actionFinished{id: id, err: m.b.react(id, target, kind)} }
+			return func() tea.Msg { return actionFinished{err: m.b.react(id, target, kind)} }
 		}
 	case uiChats:
 		switch key {
@@ -347,7 +357,14 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 			m.focus = uiHistory
 			return m.loadHistory()
 		case "i":
-			m.focus, m.draftCursor = uiCompose, len(m.drafts[id])
+			m.startCompose(draftKey{chatID: id}, "")
+		case "p", "P":
+			if err := m.pins.toggle(m.chats[m.chatIndex]); err != nil {
+				m.actionErr = fmt.Errorf("toggle pin: %w", err)
+				return nil
+			}
+			m.actionErr = nil
+			return m.orderChats()
 		default:
 			return m.moveChat(key)
 		}
@@ -356,7 +373,17 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		case "tab", "esc", "left":
 			m.focus = uiChats
 		case "i":
-			m.focus, m.draftCursor = uiCompose, len(m.drafts[id])
+			m.startCompose(draftKey{chatID: id}, "")
+		case "R":
+			if len(m.rows) > 0 {
+				m.startReply(id, m.messages[m.rows[m.rowIndex].messageIndex])
+			}
+		case "c", "C":
+			if len(m.rows) > 0 {
+				return m.copy(clipboardMessage(m.messages[m.rows[m.rowIndex].messageIndex]))
+			}
+		case "shift+enter":
+			return m.copy(m.selectedLink())
 		case "enter":
 			a := m.selectedAttachment()
 			if a.isPhoto() {
@@ -399,6 +426,14 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
+func (m *ui) copy(text string) tea.Cmd {
+	if text == "" {
+		return nil
+	}
+	m.actionErr = nil
+	return func() tea.Msg { return clipboardCopied{copyText(text)} }
+}
+
 func (m *ui) selectedAttachment() attachment {
 	if len(m.rows) == 0 {
 		return attachment{}
@@ -433,6 +468,28 @@ func (m *ui) selectedLink() string {
 		return links[0]
 	}
 	return ""
+}
+
+func (m *ui) orderChats() tea.Cmd {
+	var selected int
+	hadChat := len(m.chats) > 0
+	if hadChat {
+		selected = m.chats[m.chatIndex].ID
+	}
+	m.chats = m.pins.order(m.latestChats)
+	m.pinnedCount = 0
+	for _, c := range m.chats {
+		if !m.pins.contains(c) {
+			break
+		}
+		m.pinnedCount++
+	}
+	if i := slices.IndexFunc(m.chats, func(c chat) bool { return hadChat && c.ID == selected }); i >= 0 {
+		m.chatIndex = i
+		return nil
+	}
+	m.chatIndex = min(m.chatIndex, max(0, len(m.chats)-1))
+	return m.resetHistory()
 }
 
 func (m *ui) moveChat(key string) tea.Cmd {
@@ -472,8 +529,33 @@ func (m *ui) moveHistory(key string) {
 	m.rowIndex = index
 }
 
-func (m *ui) compose(id int, k tea.KeyMsg) tea.Cmd {
-	draft, cursor := m.drafts[id], m.draftCursor
+func (m *ui) startCompose(key draftKey, replyContext string) {
+	m.focus, m.composeDraft, m.draftCursor = uiCompose, key, len(m.drafts[key])
+	m.replyContext = replyContext
+}
+
+func (m *ui) startReply(id int, item message) {
+	guid := item.GUID
+	if item.Thread.GUID != "" {
+		if !item.Thread.canContinue() {
+			m.actionErr = errors.New("reply helper cannot continue this message part")
+			return
+		}
+		// Messages keeps replies under the original message, not the selected reply.
+		guid = item.Thread.GUID
+		var root *message
+		if i := slices.IndexFunc(m.messages, func(item message) bool { return item.GUID == guid }); i >= 0 {
+			root = &m.messages[i]
+		}
+		m.startCompose(draftKey{chatID: id, guid: guid}, threadLabel(item.Thread, root))
+	} else if guid != "" {
+		m.startCompose(draftKey{chatID: id, guid: guid}, replyMessageLabel(item))
+	}
+}
+
+func (m *ui) compose(k tea.KeyMsg) tea.Cmd {
+	key := m.composeDraft
+	draft, cursor := m.drafts[key], m.draftCursor
 	switch k.Type {
 	case tea.KeyEsc, tea.KeyTab:
 		m.focus = uiHistory
@@ -481,7 +563,12 @@ func (m *ui) compose(id int, k tea.KeyMsg) tea.Cmd {
 		text := string(draft)
 		if !m.writing && strings.TrimSpace(text) != "" {
 			m.writing, m.actionErr = true, nil
-			return func() tea.Msg { return actionFinished{id, text, m.b.send(id, text)} }
+			return func() tea.Msg {
+				if key.guid != "" {
+					return actionFinished{key, text, m.b.reply(key.chatID, key.guid, text)}
+				}
+				return actionFinished{key, text, m.b.send(key.chatID, text)}
+			}
 		}
 	case tea.KeyLeft:
 		m.draftCursor = max(0, cursor-1)
@@ -493,16 +580,16 @@ func (m *ui) compose(id int, k tea.KeyMsg) tea.Cmd {
 		m.draftCursor = len(draft)
 	case tea.KeyBackspace:
 		if cursor > 0 {
-			m.drafts[id], m.draftCursor = slices.Delete(draft, cursor-1, cursor), cursor-1
+			m.drafts[key], m.draftCursor = slices.Delete(draft, cursor-1, cursor), cursor-1
 		}
 	case tea.KeyDelete:
 		if cursor < len(draft) {
-			m.drafts[id] = slices.Delete(draft, cursor, cursor+1)
+			m.drafts[key] = slices.Delete(draft, cursor, cursor+1)
 		}
 	case tea.KeyRunes, tea.KeySpace:
 		if !k.Alt || k.Paste {
 			text := []rune(cleanText(string(k.Runes)))
-			m.drafts[id], m.draftCursor = slices.Insert(draft, cursor, text...), cursor+len(text)
+			m.drafts[key], m.draftCursor = slices.Insert(draft, cursor, text...), cursor+len(text)
 		}
 	}
 	return nil
@@ -580,6 +667,47 @@ func historyText(text string, links []string) string {
 	return strings.NewReplacer(pairs...).Replace(strings.TrimSpace(strings.Join(lines, "\n")))
 }
 
+func replyLabel(author, text string) string {
+	if author != "" {
+		text = author + ": " + text
+	}
+	return ansi.Truncate(strings.Join(strings.Fields(oneLine(text)), " "), 72, "…")
+}
+
+func replyMessageLabel(item message) string {
+	author := item.SenderName
+	if item.FromMe {
+		author = "You"
+	}
+	text := historyText(item.Text, item.Links)
+	switch {
+	case item.UnsentAt != nil:
+		text = "[Unsent message]"
+	case strings.TrimSpace(text) != "":
+	case len(item.Links) > 0:
+		text = "[Link]"
+	case len(item.Attachments) > 0:
+		text = "[Attachment]"
+	default:
+		text = "[No text]"
+	}
+	return replyLabel(author, text)
+}
+
+func threadLabel(thread threadOrigin, root *message) string {
+	if root != nil {
+		return replyMessageLabel(*root)
+	}
+	text := thread.Text
+	if text == "" && thread.UnixDate > 0 {
+		text = time.Unix(thread.UnixDate, 0).Local().Format("Jan 2, 2006 3:04 PM")
+	}
+	if text == "" {
+		text = "message " + thread.GUID[:min(8, len(thread.GUID))]
+	}
+	return replyLabel(thread.Author, text)
+}
+
 func (m *ui) setHistory(messages []message) {
 	follow := m.rowIndex >= len(m.rows)-1
 	var old historyRow
@@ -601,6 +729,10 @@ func (m *ui) setHistory(messages []message) {
 	isGroup := len(m.chats) > 0 && m.chats[m.chatIndex].IsGroup
 	var prev time.Time
 	var prevSender string
+	byGUID := make(map[string]*message, len(messages))
+	for i := range messages {
+		byGUID[messages[i].GUID] = &messages[i]
+	}
 	for i, item := range messages {
 		at := item.CreatedAt.Local()
 		if i == 0 || !sameDay(at, prev) || at.Sub(prev) >= time.Hour {
@@ -609,6 +741,10 @@ func (m *ui) setHistory(messages []message) {
 		}
 		prev = at
 		start := len(m.rows)
+		if item.Thread.GUID != "" {
+			label := threadLabel(item.Thread, byGUID[item.Thread.GUID])
+			m.rows = append(m.rows, historyRow{messageIndex: i, attachmentIndex: -1, text: "↳ " + label})
+		}
 		var sender, senderID string
 		if isGroup && !item.FromMe {
 			senderID = item.Sender
@@ -765,9 +901,23 @@ func (m *ui) historyWidth() int {
 	return m.width
 }
 
+func (m *ui) chatRow(index int) int {
+	if m.pinnedCount == 0 {
+		return index
+	}
+	if index < m.pinnedCount {
+		return index + 1
+	}
+	return index + 2
+}
+
 func (m *ui) keepSelectionVisible() {
 	height := max(1, m.bodyHeight())
-	m.chatTop = scrollTop(m.chatTop, m.chatIndex, height, len(m.chats))
+	selectedChatRow := m.chatRow(m.chatIndex)
+	m.chatTop = scrollTop(m.chatTop, selectedChatRow, height, m.chatRow(len(m.chats)-1)+1)
+	if height > 1 && m.pinnedCount > 0 && m.chatTop == selectedChatRow && (m.chatIndex == 0 || m.chatIndex == m.pinnedCount) {
+		m.chatTop--
+	}
 	m.rowTop = scrollTop(m.rowTop, m.rowIndex, height, len(m.rows))
 	if len(m.rows) > 0 {
 		start := m.rowIndex - m.rows[m.rowIndex].photoRow
@@ -827,6 +977,18 @@ func (m *ui) chatLine(row int) string {
 		return "No chats"
 	}
 	index := m.chatTop + row
+	if m.pinnedCount > 0 {
+		if index == 0 {
+			return "\x1b[2mPinned\x1b[22m"
+		}
+		index--
+		if index == m.pinnedCount && index < len(m.chats) {
+			return "\x1b[2mRecent\x1b[22m"
+		}
+		if index > m.pinnedCount {
+			index--
+		}
+	}
 	if index >= len(m.chats) {
 		return ""
 	}
@@ -884,9 +1046,9 @@ func (m *ui) footer() []string {
 	var lines []string
 	switch m.focus {
 	case uiChats:
-		lines = append(lines, "Enter Open   ↑↓ Select   q Quit")
+		lines = append(lines, "Enter Open   p Pin/Unpin   ↑↓ Select   q Quit")
 	case uiHistory:
-		keys := "i Compose   r React   Esc Chats   ↑↓ Scroll"
+		keys := "R Reply   c Copy   r React   i Compose   Esc Chats"
 		if m.moreHistory {
 			keys = "o Older   " + keys
 		}
@@ -896,11 +1058,14 @@ func (m *ui) footer() []string {
 		} else if a.isVideo() && !m.videoActive {
 			keys = "Enter Play   " + keys
 		} else if m.selectedLink() != "" {
-			keys = "Enter Link   " + keys
+			keys = "Enter Open Link   Shift+Enter Copy Link   " + keys
 		}
 		lines = append(lines, keys)
 	case uiCompose:
-		draft := m.drafts[m.chats[m.chatIndex].ID]
+		if m.composeDraft.guid != "" && m.height >= 4 {
+			lines = append(lines, "Reply to "+m.replyContext)
+		}
+		draft := m.drafts[m.composeDraft]
 		before := strings.ReplaceAll(string(draft[:m.draftCursor]), "\n", "↵")
 		after := strings.ReplaceAll(string(draft[m.draftCursor:]), "\n", "↵")
 		before = ansi.TruncateLeft(before, max(0, ansi.StringWidth(before)-max(0, m.width-3)), "")

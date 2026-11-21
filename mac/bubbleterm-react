@@ -1,5 +1,5 @@
 #!/bin/sh
-exec /usr/bin/osascript -l JavaScript - "$@" <<'JXA'
+exec /usr/bin/osascript -l JavaScript - "${0##*/}" "$@" <<'JXA'
 ObjC.import('Cocoa');
 ObjC.bindFunction('AXIsProcessTrusted', ['bool', []]);
 ObjC.bindFunction('AXUIElementCreateApplication', ['id', ['int']]);
@@ -86,8 +86,9 @@ function resolveMedia(chat, guid, target, kind) {
 
 function resolveTarget(chat, guid, filename) {
     const rows = query(`
-        SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, m.is_from_me AS outgoing,
-               m.service, m.date / 1000000000 + 978307200 AS seconds, m.part_count AS parts,
+        SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, c.service_name AS chatService,
+               m.is_from_me AS outgoing, m.service, m.thread_originator_guid AS origin,
+               m.date / 1000000000 + 978307200 AS seconds, m.part_count AS parts,
                m.text, hex(m.attributedBody) AS body
         FROM chat c
         JOIN chat_message_join j ON j.chat_id = c.ROWID
@@ -220,11 +221,11 @@ function withMenuItem(app, window, parent, requireTarget, itemID, useItem) {
             if (!opened.length) return null;
             menu = opened[0];
             const matches = find(menu, el => role(el) === 'AXMenuItem' && identifier(el) === itemID);
-            if (matches.length > 1) throw new Error('More than one menu item matches the requested tapback');
+            if (matches.length > 1) throw new Error('More than one menu item matches the requested action');
             return matches[0];
         }, 2);
         if (!item || !value(item, 'AXEnabled') || !hasAction(item, 'AXPress')) {
-            throw new Error('The requested tapback menu item is not available');
+            throw new Error('The requested Messages menu item is not available');
         }
         requireTarget();
         return useItem(item);
@@ -274,7 +275,7 @@ function targetBalloons(view, target) {
     });
 }
 
-function withTargetMenu(target, itemID, mode, useItem) {
+function withTargetMenu(target, itemID, mode, useItem, prepare) {
     if (!$.AXIsProcessTrusted()) throw new Error('Grant Accessibility access to the process that runs this helper');
     // Messages uses different prefixes for regular and pinned sidebar rows.
     const selected = () => {
@@ -314,6 +315,12 @@ function withTargetMenu(target, itemID, mode, useItem) {
 
     let current = waitFor(transcript, 3);
     if (!current) throw new Error('Cannot verify the selected Messages transcript');
+    const context = { app, window: current.window, pid: running.processIdentifier, focusedWindow };
+    if (prepare) {
+        prepare(context);
+        current = transcript();
+        if (!current || !$.CFEqual(current.window, context.window)) throw new Error('Messages switched chats or windows');
+    }
     for (let page = 0; page <= 3; page++) {
         const matches = targetBalloons(current.view, target);
         if (matches.length > 1) throw new Error('More than one balloon matches the target');
@@ -330,7 +337,7 @@ function withTargetMenu(target, itemID, mode, useItem) {
                 if (!focused || !$.CFEqual(focused, window)) throw new Error('Messages switched chats or windows');
                 const found = targetBalloons(current.view, target);
                 if (found.length !== 1 || !$.CFEqual(found[0], balloon)) throw new Error('The target balloon changed');
-            }, itemID, useItem);
+            }, itemID, item => useItem(item, context));
         }
         if (mode === '--dry-run') throw new Error('Target balloon is not visible in the selected chat');
         if (page === 3) break;
@@ -345,7 +352,7 @@ function withTargetMenu(target, itemID, mode, useItem) {
     throw new Error('Target balloon not found within three scroll pages');
 }
 
-function run(args) {
+function react(args) {
     const mode = ['--check', '--dry-run'].includes(args[0]) ? args.shift() : null;
     const [chat, guid, kind, option, filename] = args;
     const reaction = tapbacks.findIndex(entry => entry[0] === kind);
@@ -401,5 +408,155 @@ function run(args) {
             throw new Error(error.message + '. Check Messages before retrying');
         }
     });
+}
+
+function composer(context, description, placeholder) {
+    const window = context.focusedWindow();
+    if (!window || !$.CFEqual(window, context.window)) return null;
+    const views = find(window, el => identifier(el) === transcriptID);
+    if (views.length !== 1 || value(views[0], 'AXDescription') !== description) return null;
+    const entries = find(window, el => identifier(el) === 'MessageEntryView',
+        el => [transcriptID, 'ConversationList'].includes(identifier(el)));
+    if (entries.length !== 1) return null;
+    const fields = children(entries[0]).filter(el => identifier(el) === 'messageBodyField' && role(el) === 'AXTextField');
+    if (fields.length !== 1 || value(fields[0], 'AXPlaceholderValue') !== placeholder || !value(fields[0], 'AXEnabled')) return null;
+    return { view: views[0], field: fields[0], entry: entries[0] };
+}
+
+function emptyComposer(current) {
+    return ['', null].includes(value(current.field, 'AXValue')) &&
+        value(current.field, 'AXNumberOfCharacters') === 0 &&
+        children(current.entry).map(el => identifier(el) || value(el, 'AXDescription')).join(',') ===
+            'add,messageBodyField,Record audio,Emoji picker';
+}
+
+function replyComposer(context, target) {
+    const current = composer(context, 'Reply transcript', 'Reply');
+    if (!current) return null;
+    const focus = attr(context.app, 'AXFocusedUIElement');
+    if (!focus || !$.CFEqual(focus, current.field)) return null;
+    const matches = targetBalloons(current.view, target);
+    if (matches.length !== 1) return null;
+    // The thread's first message row must contain the target, not just a later reply.
+    const rows = value(current.view, 'AXVisibleChildren') || children(current.view);
+    if (!rows.length || role(rows[0]) !== 'AXButton' || value(rows[0], 'AXDescription') !== 'Dismiss replies') return null;
+    const root = rows.find(row => children(row).some(el => identifier(el) === 'Sticker'));
+    const owner = target.kind ? matches[0] : attr(matches[0], 'AXParent');
+    const row = owner && attr(owner, 'AXParent');
+    return root && row && $.CFEqual(root, row) ? current : null;
+}
+
+function keyEvents(code) {
+    const down = $.CGEventCreateKeyboardEvent(null, code, true);
+    const up = $.CGEventCreateKeyboardEvent(null, code, false);
+    $.CGEventSetFlags(down, 0);
+    $.CGEventSetFlags(up, 0);
+    return [down, up];
+}
+
+function postKey(pid, events) {
+    for (const event of events) $.CGEventPostToPid(pid, event);
+}
+
+function prepareReply(context) {
+    // Reply panes can stay open when the same conversation is opened again.
+    const open = composer(context, 'Reply transcript', 'Reply');
+    if (open) {
+        const focus = attr(context.app, 'AXFocusedUIElement');
+        if (!emptyComposer(open) || !focus || !$.CFEqual(focus, open.field)) {
+            throw new Error('Close the existing reply pane in Messages first');
+        }
+        postKey(context.pid, keyEvents(53)); // Escape closes the empty reply pane.
+    }
+    const normal = waitFor(() => composer(context, 'Messages', 'iMessage'), 2);
+    if (!normal || !emptyComposer(normal)) throw new Error('Cannot verify an empty iMessage composer before opening the thread');
+}
+
+function reply(args) {
+    const dryRun = args[0] === '--dry-run';
+    if (dryRun) args.shift();
+    const [chat, guid, text] = args;
+    if (args.length !== 3 || !/^[1-9][0-9]{0,18}$/.test(chat) || (chat.length === 19 && chat > '9223372036854775807') ||
+        !guid || !text.trim() || /[\x00\ufffc]/.test(text)) {
+        throw new Error('Usage: bubbleterm-reply [--dry-run] CHAT_ID MESSAGE_GUID TEXT');
+    }
+    const origin = sqlQuote(guid);
+    const target = resolveTarget(chat, origin);
+    if (target.service !== 'iMessage' || target.chatService !== 'iMessage') throw new Error('Only iMessage threads are supported');
+    if (target.origin || target.parts !== target.part + 1) throw new Error('Cannot isolate a replyable thread origin');
+    const part = `${target.part}:${target.part}:${target.kind ? 1 : target.text.length}`;
+
+    ObjC.import('Quartz');
+    ObjC.bindFunction('CGPreflightPostEventAccess', ['bool', []]);
+    ObjC.bindFunction('AXUIElementIsAttributeSettable', ['int', ['id', 'id', 'bool*']]);
+    ObjC.bindFunction('AXUIElementSetAttributeValue', ['int', ['id', 'id', 'id']]);
+    if (!$.CGPreflightPostEventAccess()) throw new Error('The helper cannot post a key to Messages');
+
+    const context = withTargetMenu(target, 'reply…', dryRun ? '--check' : null, (item, context) => {
+        const normal = composer(context, 'Messages', 'iMessage');
+        if (!normal || !emptyComposer(normal)) throw new Error('Cannot verify an empty iMessage composer before opening the thread');
+        if (value(item, 'AXTitle') !== 'Reply…') throw new Error('Cannot verify the Reply menu item');
+        const status = $.AXUIElementPerformAction(item, 'AXPress');
+        if (status !== 0) throw new Error('Cannot choose Reply (AX error ' + status + ')');
+        return context;
+    }, prepareReply);
+    const probe = () => replyComposer(context, target);
+    const current = waitFor(probe, 3);
+    if (!current || !emptyComposer(current)) throw new Error('Cannot verify an empty composer for the exact reply thread');
+    const settable = Ref();
+    if ($.AXUIElementIsAttributeSettable(current.field, 'AXValue', settable) !== 0 || !settable[0]) {
+        throw new Error('Cannot set text in the reply composer');
+    }
+    if (dryRun) return 'Reply menu and exact thread composer verified. No text entered or sent.';
+
+    const after = query('SELECT CAST(COALESCE(max(ROWID), 0) AS TEXT) AS id FROM message')[0].id;
+    const submit = keyEvents(36);
+    const empty = probe();
+    if (!empty || !$.CFEqual(empty.field, current.field) || !emptyComposer(empty)) {
+        throw new Error('The reply composer changed before text entry');
+    }
+    // Write only to the verified field. Do not use the keyboard or pasteboard for text.
+    const entered = $.AXUIElementSetAttributeValue(current.field, 'AXValue', $(text));
+    if (entered !== 0) throw new Error('Cannot set reply text (AX error ' + entered + '). Check Messages for an unsent draft');
+    const ready = probe();
+    const focus = attr(context.app, 'AXFocusedUIElement');
+    if (!ready || !$.CFEqual(ready.field, current.field) || value(ready.field, 'AXValue') !== text ||
+        value(ready.view, 'AXDescription') !== 'Reply transcript' || !focus || !$.CFEqual(focus, ready.field)) {
+        throw new Error('Reply composer or text changed. Check Messages for an unsent draft');
+    }
+    // Messages sends on Return. Post once to its PID, never to the global event stream.
+    try {
+        postKey(context.pid, submit);
+        const needle = sqlQuote(text);
+        const recorded = waitFor(() => {
+            const rows = query(`
+                SELECT m.guid, m.service, m.text, hex(m.attributedBody) AS body,
+                       m.thread_originator_guid AS origin, m.thread_originator_part AS part,
+                       m.is_sent AS sent, m.is_finished AS finished, m.error
+                FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID
+                WHERE m.ROWID > ${after} AND j.chat_id = ${chat} AND m.is_from_me = 1
+                  AND COALESCE(m.associated_message_type, 0) = 0
+                  AND (m.thread_originator_guid COLLATE BINARY = ${origin} OR m.text COLLATE BINARY = ${needle}
+                    OR instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0)`)
+                .filter(row => row.origin === guid || messageText(row) === text);
+            if (rows.length > 1) throw new Error('More than one outgoing message matches the reply');
+            const [row] = rows;
+            if (!row) return null;
+            if (row.error) throw new Error('Messages reported a send error');
+            if (!row.sent || !row.finished) return null;
+            if (row.service !== 'iMessage' || row.origin !== guid || row.part !== part || messageText(row) !== text) {
+                throw new Error('The outgoing message did not match the exact iMessage thread and text');
+            }
+            return row.guid;
+        }, 10);
+        if (!recorded) throw new Error('No matching sent iMessage reply was recorded');
+        return recorded;
+    } catch (error) {
+        throw new Error(error.message + '. Check Messages before retrying');
+    }
+}
+
+function run(args) {
+    return args.shift() === 'bubbleterm-reply' ? reply(args) : react(args);
 }
 JXA

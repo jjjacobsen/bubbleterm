@@ -35,6 +35,7 @@ type message struct {
 	BalloonBundleID    string       `json:"balloon_bundle_id"`
 	Attachments        []attachment `json:"attachments"`
 	Links              []string     `json:"-"`
+	Thread             threadOrigin `json:"-"`
 	MyReaction         string       `json:"-"`
 	OtherReactions     string       `json:"-"`
 	SelectedAttachment *attachment  `json:"-"`
@@ -236,6 +237,9 @@ func (b backend) history(id, limit int) ([]message, bool, error) {
 		return nil, false, err
 	}
 	if err := b.loadHistoryLinks(rows); err != nil {
+		return nil, false, err
+	}
+	if err := b.loadHistoryThreads(rows); err != nil {
 		return nil, false, err
 	}
 	slices.Reverse(rows)
