@@ -531,16 +531,27 @@ func (m *ui) moveHistory(key string) {
 		return
 	}
 	index := m.rowIndex
-	up := key == "up" || key == "k"
-	if up {
-		index -= m.rows[index].photoRow
+	switch key {
+	case "up", "k", "down", "j":
+		step := 1
+		if key == "up" || key == "k" {
+			step = -1
+		}
+		current := m.rows[index]
+		for i := index + step; i >= 0 && i < len(m.rows); i += step {
+			next := m.rows[i]
+			if next.messageIndex < 0 || next.sameItem(current) {
+				continue
+			}
+			for i > 0 && next.sameItem(m.rows[i-1]) {
+				i--
+			}
+			m.rowIndex = i
+			break
+		}
+		return
 	}
 	index = moveIndex(key, index, len(m.rows), m.bodyHeight())
-	if key == "down" || key == "j" {
-		for index < len(m.rows)-1 && m.rows[index].photoRow > 0 {
-			index++
-		}
-	}
 	if m.rows[index].messageIndex < 0 {
 		if index > 0 && index < m.rowIndex {
 			index--
@@ -548,10 +559,11 @@ func (m *ui) moveHistory(key string) {
 			index++
 		}
 	}
-	if up {
-		index -= m.rows[index].photoRow
-	}
 	m.rowIndex = index
+}
+
+func (r historyRow) sameItem(other historyRow) bool {
+	return r.messageIndex == other.messageIndex && r.attachmentIndex == other.attachmentIndex && r.linkNumber == other.linkNumber
 }
 
 func (m *ui) startCompose(key draftKey, replyContext string) {
