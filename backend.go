@@ -21,6 +21,7 @@ type chat struct {
 	ID          int    `json:"id"`
 	Name        string `json:"name"`
 	IsGroup     bool   `json:"is_group"`
+	Unread      bool   `json:"unread"`
 	ContactName string `json:"contact_name,omitempty"`
 	Identifier  string `json:"identifier,omitempty"`
 }
@@ -201,7 +202,14 @@ func readRows[T any](b backend, op, remote string) ([]T, error) {
 }
 
 func (b backend) chats() ([]chat, error) {
-	return readRows[chat](b, "list chats", "chats --limit 100 --json")
+	chats, err := readRows[chat](b, "list chats", "chats --limit 100 --json")
+	if err != nil {
+		return nil, err
+	}
+	if err := b.loadUnread(chats); err != nil {
+		return nil, err
+	}
+	return chats, nil
 }
 
 func (b backend) history(id, limit int) ([]message, bool, error) {

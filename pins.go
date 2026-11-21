@@ -66,6 +66,7 @@ func (p *pins) toggle(c chat) error {
 	if i := p.index(c); i >= 0 {
 		chats = slices.Delete(chats, i, i+1)
 	} else {
+		c.Unread = false
 		chats = append(chats, c)
 	}
 
@@ -98,6 +99,8 @@ func (p *pins) order(latest []chat) []chat {
 		if current, ok := byID[c.ID]; ok {
 			c = current
 			delete(byID, c.ID)
+		} else {
+			c.Unread = false
 		}
 		ordered = append(ordered, c)
 	}

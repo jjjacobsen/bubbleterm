@@ -43,6 +43,8 @@ type historyLoaded struct {
 	err       error
 }
 
+type chatViewed struct{ err error }
+
 type draftKey struct {
 	chatID int
 	guid   string
@@ -159,6 +161,9 @@ type ui struct {
 	pins                            *pins
 	latestChats, chats              []chat
 	pinnedCount, chatIndex, chatTop int
+	viewPending, viewing            int // chat IDs of queued and running opens
+	viewErr                         error
+	terminalBlurred                 bool
 	messages                        []message
 	rows                            []historyRow
 	historySearch                   []historySearchBlock
@@ -206,7 +211,7 @@ func runUI(b *backend) error {
 	}()
 	m.accents = make(chan themeAccent)
 	go watchAccent(done, m.accents)
-	_, err = tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(func(_ tea.Model, msg tea.Msg) tea.Msg {
+	_, err = tea.NewProgram(m, tea.WithAltScreen(), tea.WithReportFocus(), tea.WithFilter(func(_ tea.Model, msg tea.Msg) tea.Msg {
 		switch msg.(type) {
 		case tea.QuitMsg, tea.InterruptMsg:
 			g.close()
@@ -295,6 +300,7 @@ func (m *ui) refresh() tea.Cmd {
 }
 
 func (m *ui) resetHistory() tea.Cmd {
+	m.viewPending, m.viewErr = 0, nil
 	m.messages, m.rows, m.historySearch = nil, nil, nil
 	if m.focus == uiHistory {
 		m.search = nil
@@ -319,12 +325,55 @@ func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	cmd := m.update(msg)
+	view := m.maybeViewChat()
 	m.keepSelectionVisible()
-	return m, tea.Batch(cmd, m.loadPreviews())
+	return m, tea.Batch(cmd, view, m.loadPreviews())
+}
+
+func (m *ui) atLatestMessage() bool {
+	return len(m.rows) > 0 && m.rows[m.rowIndex].messageIndex == len(m.messages)-1
+}
+
+func (m *ui) requestViewChat() {
+	c := m.chats[m.chatIndex]
+	if c.Unread && c.ID != m.viewing && (len(m.rows) == 0 || m.atLatestMessage()) {
+		m.viewPending, m.viewErr, m.actionErr = c.ID, nil, nil
+	}
+}
+
+func (m *ui) maybeViewChat() tea.Cmd {
+	id := m.viewPending
+	if id == 0 {
+		return nil
+	}
+	if m.focus != uiHistory || m.search != nil || m.terminalBlurred || len(m.chats) == 0 ||
+		m.chats[m.chatIndex].ID != id || !m.chats[m.chatIndex].Unread ||
+		(len(m.rows) > 0 && !m.atLatestMessage()) {
+		m.viewPending = 0
+		return nil
+	}
+	// Refreshes may resolve a chat as already read or move the latest message.
+	if m.viewing != 0 || m.chatsBusy || m.historyBusy {
+		return nil
+	}
+	m.viewPending = 0
+	if m.chatsErr != nil || m.historyErr != nil {
+		return nil
+	}
+	if !m.atLatestMessage() {
+		m.viewErr = errors.New("latest message is not available")
+		return nil
+	}
+	m.viewing = id
+	return func() tea.Msg { return chatViewed{m.b.viewChat(id)} }
 }
 
 func (m *ui) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
+	case tea.FocusMsg:
+		m.terminalBlurred = false
+	case tea.BlurMsg:
+		m.terminalBlurred = true
 	case themeAccent:
 		m.accent = msg
 		return m.waitForAccent
@@ -340,6 +389,9 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		if msg.err == nil {
 			m.latestChats = msg.chats
 			history = m.orderChats()
+			if len(m.chats) > 0 && !m.chats[m.chatIndex].Unread {
+				m.viewErr = nil
+			}
 			if m.search != nil && m.focus == uiChats {
 				m.updateSearch()
 			}
@@ -370,6 +422,15 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		}
 		if m.historyAgain {
 			return m.loadHistory()
+		}
+	case chatViewed:
+		id := m.viewing
+		m.viewing = 0
+		if msg.err == nil {
+			return m.loadChats()
+		}
+		if len(m.chats) > 0 && m.chats[m.chatIndex].ID == id && m.chats[m.chatIndex].Unread {
+			m.viewErr = msg.err
 		}
 	case previewLoaded:
 		m.previewsBusy--
@@ -469,6 +530,7 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		switch key {
 		case "tab", "enter", "right":
 			m.focus = uiHistory
+			m.requestViewChat()
 			return m.loadHistory()
 		case "i":
 			m.startCompose(draftKey{chatID: id}, "")
@@ -498,6 +560,8 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 			}
 		case "shift+enter":
 			return m.copy(m.selectedLink())
+		case "m":
+			m.requestViewChat()
 		case "enter":
 			a := m.selectedAttachment()
 			if a.isPhoto() {
@@ -505,9 +569,11 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 					m.writing, m.actionErr = true, nil
 					return func() tea.Msg { return photoOpened{m.b.openPhoto(a)} }
 				}
-			} else if a.isVideo() && !m.videoActive {
-				m.videoActive, m.actionErr = true, nil
-				return func() tea.Msg { return videoFinished{m.b.playVideo(a)} }
+			} else if a.isVideo() {
+				if !m.videoActive {
+					m.videoActive, m.actionErr = true, nil
+					return func() tea.Msg { return videoFinished{m.b.playVideo(a)} }
+				}
 			} else if link := m.selectedLink(); link != "" {
 				m.actionErr = nil
 				return func() tea.Msg {
@@ -516,6 +582,8 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 					}
 					return linkOpened{}
 				}
+			} else if len(m.rows) == 0 || m.rows[m.rowIndex].attachmentIndex < 0 {
+				m.requestViewChat()
 			}
 		case "o":
 			if m.moreHistory {
@@ -1197,7 +1265,11 @@ func (m *ui) View() string {
 	height := max(0, m.height-1-len(footer))
 	title := "History"
 	if len(m.chats) > 0 {
-		title = chatName(m.chats[m.chatIndex])
+		c := m.chats[m.chatIndex]
+		title = chatName(c)
+		if c.Unread && m.sidebarWidth() == 0 {
+			title = "• " + title
+		}
 	}
 	var lines []string
 	if sidebar := m.sidebarWidth(); sidebar > 0 {
@@ -1249,15 +1321,20 @@ func (m *ui) chatLine(row int) string {
 	if index >= len(m.chats) {
 		return ""
 	}
-	name := chatName(m.chats[index])
-	mark := marker(index == selected)
+	c := m.chats[index]
+	name := chatName(c)
+	dot := "  "
+	if c.Unread {
+		dot = "• "
+	}
+	mark := marker(index == selected) + dot
 	if m.search != nil && m.focus == uiChats {
 		if label, ok := m.search.chatLabels[index]; ok {
 			width := m.sidebarWidth()
 			if width == 0 {
 				width = m.width
 			}
-			name = m.search.highlight(index, label, width-len(mark))
+			name = m.search.highlight(index, label, width-ansi.StringWidth(mark))
 		}
 	}
 	return mark + name
@@ -1331,13 +1408,20 @@ func (m *ui) footer() []string {
 		if m.moreHistory {
 			keys = "o Older   " + keys
 		}
-		a := m.selectedAttachment()
+		a, link := m.selectedAttachment(), m.selectedLink()
 		if a.isPhoto() {
 			keys = "Enter Photo   " + keys
 		} else if a.isVideo() && !m.videoActive {
 			keys = "Enter Play   " + keys
-		} else if m.selectedLink() != "" {
+		} else if link != "" {
 			keys = "Enter Open Link   Shift+Enter Copy Link   " + keys
+		}
+		if m.atLatestMessage() && m.chats[m.chatIndex].Unread {
+			key := "m"
+			if !a.isPhoto() && !a.isVideo() && link == "" && m.rows[m.rowIndex].attachmentIndex < 0 {
+				key = "Enter"
+			}
+			keys = key + " Mark Read   " + keys
 		}
 		lines = append(lines, keys)
 	case m.focus == uiCompose:
@@ -1386,6 +1470,11 @@ func (m *ui) status() string {
 		return "Chats: " + oneLine(m.chatsErr.Error())
 	case m.historyErr != nil:
 		return "History: " + oneLine(m.historyErr.Error())
+	case m.viewErr != nil && m.focus == uiHistory:
+		return "Open chat: " + oneLine(m.viewErr.Error())
+	case m.focus == uiHistory && len(m.chats) > 0 &&
+		(m.chats[m.chatIndex].ID == m.viewPending || m.chats[m.chatIndex].ID == m.viewing):
+		return "Waiting for Mac to mark chat read…"
 	case m.historyBusy && m.moreHistory && m.historyLimit > len(m.messages):
 		return "Loading older messages…"
 	case m.writing:
