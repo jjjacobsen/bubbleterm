@@ -47,7 +47,7 @@ func (b backend) loadHistoryThreads(rows []message) error {
 		ids[i] = strconv.Itoa(row.ID)
 	}
 	query := fmt.Sprintf(historyThreadsQuery, strings.Join(ids, ","))
-	out, err := b.run("read reply threads", `exec /usr/bin/sqlite3 -batch -bail -readonly -init /dev/null -json "$HOME/Library/Messages/chat.db" `+shellQuote(query))
+	out, err := b.read("read reply threads", `exec /usr/bin/sqlite3 -batch -bail -readonly -init /dev/null -json "$HOME/Library/Messages/chat.db" `+shellQuote(query))
 	if err != nil || len(out) == 0 {
 		return err
 	}
@@ -70,6 +70,5 @@ func (b backend) loadHistoryThreads(rows []message) error {
 
 func (b backend) reply(id int, guid, text string) error {
 	command := fmt.Sprintf(`exec "$HOME/.local/bin/bubbleterm-reply" %d %s %s`, id, shellQuote(guid), shellQuote(text))
-	_, err := b.run("send reply", command)
-	return err
+	return b.run("send reply", command)
 }

@@ -101,7 +101,7 @@ func (b backend) loadHistoryLinks(rows []message) error {
 	if len(ids) != 0 {
 		command := imsgPath + "exec uv --no-config --offline run --no-project --no-managed-python --no-python-downloads --python /usr/bin/python3 python - " +
 			shellQuote(linkBalloon) + " " + strings.Join(ids, " ") + " <<'PY'\n" + readLinkPreviews + "PY"
-		out, err := b.run("read link previews", command)
+		out, err := b.read("read link previews", command)
 		if err != nil {
 			return err
 		}

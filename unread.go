@@ -19,7 +19,7 @@ WHERE m.is_read = 0 AND m.is_from_me = 0 AND m.item_type = 0
   AND m.date > c.last_read_message_timestamp`
 
 func (b backend) loadUnread(chats []chat) error {
-	out, err := b.run("read unread state", queryMessagesDB+shellQuote(unreadChatsQuery))
+	out, err := b.read("read unread state", queryMessagesDB+shellQuote(unreadChatsQuery))
 	if err != nil {
 		return err
 	}
@@ -46,7 +46,7 @@ SELECT target.guid, CASE WHEN NOT EXISTS (SELECT 1 FROM chat other WHERE other.R
 FROM chat AS target WHERE target.ROWID = %d AND target.guid <> ''`
 
 func (b backend) viewChat(id int) error {
-	out, err := b.run("resolve Messages chat", queryMessagesDB+shellQuote(fmt.Sprintf(viewChatQuery, id)))
+	out, err := b.read("resolve Messages chat", queryMessagesDB+shellQuote(fmt.Sprintf(viewChatQuery, id)))
 	if err != nil {
 		return err
 	}
@@ -78,8 +78,7 @@ for n in 0 1 2 3 4 5; do
 done
 echo 'Messages still reports this chat as unread after Mark as Read.' >&2
 exit 1`
-	_, err = b.run("mark chat read", "/bin/sh -c "+shellQuote(command))
-	return err
+	return b.run("mark chat read", "/bin/sh -c "+shellQuote(command))
 }
 
 const markChatReadAX = `

@@ -46,6 +46,7 @@ type message struct {
 
 const imsgPath = "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH "
 const imsg = imsgPath + "exec imsg "
+const readTimeout = 15 * time.Second
 
 // imsg can outlive a non-interactive SSH channel. Stop it when SSH stdin closes.
 const watchCommand = `exec 3<&0
@@ -109,9 +110,11 @@ func (s *sshSession) start(host string) error {
 		return nil
 	}
 	// Establish the master before parallel reads and watch can race to create it.
-	out, err := s.ssh(s.ctx, "-fN", "--", host).CombinedOutput()
+	ctx, cancel := context.WithTimeout(s.ctx, readTimeout)
+	defer cancel()
+	out, err := s.ssh(ctx, "-fN", "--", host).CombinedOutput()
 	if err != nil {
-		return remoteError("open SSH connection", err, out)
+		return remoteError("open SSH connection", errors.Join(ctx.Err(), err), out)
 	}
 	s.started = true
 	return nil
@@ -161,30 +164,40 @@ func remoteError(op string, err error, out []byte) error {
 	return fmt.Errorf("%s: %w", op, err)
 }
 
-func (b backend) run(op, remote string) ([]byte, error) {
+func (b backend) read(op, remote string) ([]byte, error) {
 	var out bytes.Buffer
-	if err := b.runTo(op, remote, &out); err != nil {
+	if err := b.runTo(op, remote, &out, readTimeout); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
 }
 
-func (b backend) runTo(op, remote string, out io.Writer) error {
+func (b backend) run(op, remote string) error {
+	return b.runTo(op, remote, io.Discard, 0)
+}
+
+func (b backend) runTo(op, remote string, out io.Writer, timeout time.Duration) error {
 	s, err := b.open()
 	if err != nil {
 		return err
 	}
-	cmd := s.ssh(s.ctx, "--", b.host, remote)
+	ctx := s.ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := s.ssh(ctx, "--", b.host, remote)
 	var stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = out, &stderr
 	if err := cmd.Run(); err != nil {
-		return remoteError(op, err, stderr.Bytes())
+		return remoteError(op, errors.Join(ctx.Err(), err), stderr.Bytes())
 	}
 	return nil
 }
 
 func readRows[T any](b backend, op, remote string) ([]T, error) {
-	out, err := b.run(op, imsg+remote)
+	out, err := b.read(op, imsg+remote)
 	if err != nil {
 		return nil, err
 	}
@@ -247,8 +260,7 @@ func shellQuote(value string) string {
 }
 
 func (b backend) send(id int, text string) error {
-	_, err := b.run("send message", imsg+fmt.Sprintf("send --chat-id %d %s", id, shellQuote("--text="+text)))
-	return err
+	return b.run("send message", imsg+fmt.Sprintf("send --chat-id %d %s", id, shellQuote("--text="+text)))
 }
 
 func (b backend) react(id int, m message, kind string) error {
@@ -256,8 +268,7 @@ func (b backend) react(id int, m message, kind string) error {
 	if m.SelectedAttachment != nil {
 		command += " --attachment " + shellQuote(m.SelectedAttachment.Filename)
 	}
-	_, err := b.run("react to message", command)
-	return err
+	return b.run("react to message", command)
 }
 
 // watch blocks until the stream stops or close cancels it.

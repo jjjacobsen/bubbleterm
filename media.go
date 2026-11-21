@@ -239,7 +239,7 @@ func (b backend) cacheAttachment(dir, file, remote string) error {
 		return err
 	}
 	defer os.Remove(out.Name())
-	transferErr := b.runTo("download attachment", remote, out)
+	transferErr := b.runTo("download attachment", remote, out, 0)
 	if err := errors.Join(transferErr, out.Close()); err != nil {
 		return err
 	}

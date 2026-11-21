@@ -372,6 +372,7 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.FocusMsg:
 		m.terminalBlurred = false
+		return m.refresh()
 	case tea.BlurMsg:
 		m.terminalBlurred = true
 	case themeAccent:
@@ -863,6 +864,7 @@ func (m *ui) sendDraft(key draftKey, draft *messageDraft) tea.Cmd {
 	if m.writing || (draft.file == nil && strings.TrimSpace(text) == "") {
 		return nil
 	}
+	m.focus = uiHistory
 	m.writing, m.sending, m.actionErr = true, draft, nil
 	draft.inputErr = nil
 	if draft.file != nil {

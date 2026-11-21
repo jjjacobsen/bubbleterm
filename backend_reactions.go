@@ -71,7 +71,7 @@ func (b backend) loadHistoryDetails(rows []message) error {
 	// Match by target GUID, not chat membership: synced reactions can be in a different chat.
 	// imsg does not distinguish body parts or replace different reactions from the same sender.
 	query := fmt.Sprintf(historyDetailsQuery, strings.Join(ids, ","))
-	out, err := b.run("read history details", `exec /usr/bin/sqlite3 -batch -bail -readonly -init /dev/null -json "$HOME/Library/Messages/chat.db" `+shellQuote(query))
+	out, err := b.read("read history details", `exec /usr/bin/sqlite3 -batch -bail -readonly -init /dev/null -json "$HOME/Library/Messages/chat.db" `+shellQuote(query))
 	if err != nil || len(out) == 0 {
 		return err
 	}
