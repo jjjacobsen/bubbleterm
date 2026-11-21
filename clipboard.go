@@ -65,6 +65,12 @@ func terminalKey(msg tea.Msg) tea.Msg {
 			return tea.KeyMsg{Type: tea.KeyCtrlJ}
 		case "?CSI[49 48 55 59 53 117]?": // 107;5u
 			return tea.KeyMsg{Type: tea.KeyCtrlK}
+		case "?CSI[49 49 49 59 53 117]?": // 111;5u
+			return tea.KeyMsg{Type: tea.KeyCtrlO}
+		case "?CSI[49 49 56 59 53 117]?": // 118;5u
+			return tea.KeyMsg{Type: tea.KeyCtrlV}
+		case "?CSI[49 50 48 59 53 117]?": // 120;5u
+			return tea.KeyMsg{Type: tea.KeyCtrlX}
 		}
 	}
 	return msg

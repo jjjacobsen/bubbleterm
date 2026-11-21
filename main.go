@@ -48,10 +48,71 @@ type draftKey struct {
 	guid   string
 }
 
-type actionFinished struct {
-	draft draftKey
+type messageDraft struct {
+	text     []rune
+	cursor   int
+	file     *draftFile
+	input    string
+	inputErr error
+}
+
+func (d *messageDraft) insert(text string) {
+	runes := []rune(cleanText(text))
+	d.text = slices.Insert(d.text, d.cursor, runes...)
+	d.cursor += len(runes)
+}
+
+type draftInput struct {
+	key   draftKey
 	text  string
+	file  *draftFile
 	err   error
+	ready chan struct{} // non-nil for a clipboard read
+}
+
+type actionFinished struct {
+	draft *messageDraft
+	err   error
+}
+
+type fileUpload struct {
+	size, sent int64
+	updates    chan int64
+	lastReport time.Time
+}
+
+type uploadProgress struct {
+	upload *fileUpload
+	sent   int64
+}
+
+func (u *fileUpload) wait(done <-chan struct{}) tea.Msg {
+	select {
+	case sent, ok := <-u.updates:
+		if ok {
+			return uploadProgress{u, sent}
+		}
+	case <-done:
+	}
+	return nil
+}
+
+func (u *fileUpload) report(sent int64) {
+	now := time.Now()
+	if sent < u.size && now.Sub(u.lastReport) < 100*time.Millisecond {
+		return
+	}
+	u.lastReport = now
+	// Keep the newest update without making the transfer wait for the UI.
+	select {
+	case u.updates <- sent:
+	default:
+		select {
+		case <-u.updates:
+		default:
+		}
+		u.updates <- sent
+	}
 }
 
 type photoOpened struct{ err error }
@@ -103,10 +164,12 @@ type ui struct {
 	historySearch                   []historySearchBlock
 	rowIndex, rowTop                int
 	search                          *paneSearch
-	drafts                          map[draftKey][]rune
+	drafts                          map[draftKey]*messageDraft
 	composeDraft                    draftKey
-	draftCursor                     int
 	replyContext                    string
+	clipboardRead                   *draftInput
+	sending                         *messageDraft
+	upload                          *fileUpload
 	target                          message
 	chatsBusy, chatsAgain           bool
 	historyBusy, historyAgain       bool
@@ -134,10 +197,13 @@ func runUI(b *backend) error {
 		return fmt.Errorf("load pinned chats: %w", err)
 	}
 	done := make(chan struct{})
-	defer close(done)
 	g := newGraphics()
 	defer g.close()
-	m := &ui{b: b, g: g, events: make(chan struct{}, 1), done: done, pins: p, drafts: make(map[draftKey][]rune)}
+	m := &ui{b: b, g: g, events: make(chan struct{}, 1), done: done, pins: p, drafts: make(map[draftKey]*messageDraft)}
+	defer func() {
+		close(done)
+		m.cleanupDrafts()
+	}()
 	m.accents = make(chan themeAccent)
 	go watchAccent(done, m.accents)
 	_, err = tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(func(_ tea.Model, msg tea.Msg) tea.Msg {
@@ -148,6 +214,21 @@ func runUI(b *backend) error {
 		return terminalKey(msg)
 	})).Run()
 	return err
+}
+
+func (m *ui) cleanupDrafts() {
+	// A clipboard read can create a temporary file after the event loop stops.
+	if read := m.clipboardRead; read != nil {
+		<-read.ready
+		if read.file != nil {
+			read.file.cleanup()
+		}
+	}
+	for _, draft := range m.drafts {
+		if draft.file != nil {
+			draft.file.cleanup()
+		}
+	}
 }
 
 func (m *ui) Init() tea.Cmd {
@@ -328,16 +409,24 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		return tea.Batch(m.watch(), m.refresh())
 	case catchUp:
 		return tea.Batch(catchUpLater(), m.refresh())
+	case *draftInput:
+		m.finishDraftInput(msg)
+	case uploadProgress:
+		if m.upload == msg.upload {
+			m.upload.sent = msg.sent
+			return func() tea.Msg { return msg.upload.wait(m.done) }
+		}
 	case actionFinished:
 		m.writing, m.actionErr = false, msg.err
+		m.sending, m.upload = nil, nil
 		if msg.err != nil {
 			return nil
 		}
-		if msg.text != "" && string(m.drafts[msg.draft]) == msg.text {
-			delete(m.drafts, msg.draft)
-			if m.focus == uiCompose && m.composeDraft == msg.draft {
-				m.draftCursor = 0
+		if draft := msg.draft; draft != nil {
+			if draft.file != nil {
+				draft.file.cleanup()
 			}
+			*draft = messageDraft{}
 		}
 		return m.refresh()
 	case tea.KeyMsg:
@@ -567,8 +656,10 @@ func (r historyRow) sameItem(other historyRow) bool {
 }
 
 func (m *ui) startCompose(key draftKey, replyContext string) {
-	m.focus, m.composeDraft, m.draftCursor = uiCompose, key, len(m.drafts[key])
-	m.replyContext = replyContext
+	m.focus, m.composeDraft, m.replyContext = uiCompose, key, replyContext
+	if m.drafts[key] == nil {
+		m.drafts[key] = &messageDraft{}
+	}
 }
 
 func (m *ui) startReply(id int, item message) {
@@ -590,46 +681,137 @@ func (m *ui) startReply(id int, item message) {
 	}
 }
 
+var errReplyAttachment = errors.New("thread replies do not support attachments")
+var errReplaceAttachment = errors.New("remove the attachment with Ctrl+X first")
+
 func (m *ui) compose(k tea.KeyMsg) tea.Cmd {
 	key := m.composeDraft
-	draft, cursor := m.drafts[key], m.draftCursor
-	switch k.Type {
-	case tea.KeyEsc, tea.KeyTab:
+	draft := m.drafts[key]
+	if k.Type == tea.KeyEsc || k.Type == tea.KeyTab {
 		m.focus = uiHistory
+		return nil
+	}
+	if draft == m.sending || draft.input != "" {
+		return nil
+	}
+	cursor := draft.cursor
+	switch k.Type {
 	case tea.KeyEnter:
-		text := string(draft)
-		if !m.writing && strings.TrimSpace(text) != "" {
-			m.writing, m.actionErr = true, nil
-			return func() tea.Msg {
-				if key.guid != "" {
-					return actionFinished{key, text, m.b.reply(key.chatID, key.guid, text)}
-				}
-				return actionFinished{key, text, m.b.send(key.chatID, text)}
-			}
+		return m.sendDraft(key, draft)
+	case tea.KeyCtrlV:
+		m.actionErr = nil
+		if m.clipboardRead != nil {
+			draft.inputErr = errors.New("clipboard read in progress")
+			return nil
+		}
+		draft.input, draft.inputErr = "Reading clipboard…", nil
+		read := &draftInput{key: key, ready: make(chan struct{})}
+		m.clipboardRead = read
+		go func() {
+			defer close(read.ready)
+			read.text, read.file, read.err = pasteClipboard()
+		}()
+		return func() tea.Msg {
+			<-read.ready
+			return read
+		}
+	case tea.KeyCtrlO:
+		m.actionErr = nil
+		if key.guid != "" {
+			draft.inputErr = errReplyAttachment
+			return nil
+		}
+		if draft.file != nil {
+			draft.inputErr = errReplaceAttachment
+			return nil
+		}
+		draft.input, draft.inputErr = "Choosing file…", nil
+		return func() tea.Msg {
+			file, err := pickFile()
+			return &draftInput{key: key, file: file, err: err}
+		}
+	case tea.KeyCtrlX:
+		if draft.file != nil {
+			draft.file.cleanup()
+			draft.file, draft.inputErr, m.actionErr = nil, nil, nil
 		}
 	case tea.KeyLeft:
-		m.draftCursor = max(0, cursor-1)
+		draft.cursor = max(0, cursor-1)
 	case tea.KeyRight:
-		m.draftCursor = min(len(draft), cursor+1)
+		draft.cursor = min(len(draft.text), cursor+1)
 	case tea.KeyHome:
-		m.draftCursor = 0
+		draft.cursor = 0
 	case tea.KeyEnd:
-		m.draftCursor = len(draft)
+		draft.cursor = len(draft.text)
 	case tea.KeyBackspace:
 		if cursor > 0 {
-			m.drafts[key], m.draftCursor = slices.Delete(draft, cursor-1, cursor), cursor-1
+			draft.text, draft.cursor = slices.Delete(draft.text, cursor-1, cursor), cursor-1
 		}
 	case tea.KeyDelete:
-		if cursor < len(draft) {
-			m.drafts[key] = slices.Delete(draft, cursor, cursor+1)
+		if cursor < len(draft.text) {
+			draft.text = slices.Delete(draft.text, cursor, cursor+1)
 		}
 	case tea.KeyRunes, tea.KeySpace:
 		if !k.Alt || k.Paste {
-			text := []rune(cleanText(string(k.Runes)))
-			m.drafts[key], m.draftCursor = slices.Insert(draft, cursor, text...), cursor+len(text)
+			draft.insert(string(k.Runes))
 		}
 	}
 	return nil
+}
+
+func (m *ui) finishDraftInput(msg *draftInput) {
+	if msg.ready != nil {
+		m.clipboardRead = nil
+	}
+	draft := m.drafts[msg.key]
+	draft.input = ""
+	err := msg.err
+	if err == nil && msg.file != nil {
+		switch {
+		case msg.key.guid != "":
+			err = errReplyAttachment
+		case draft.file != nil:
+			err = errReplaceAttachment
+		default:
+			draft.file = msg.file
+		}
+	}
+	if err != nil {
+		if msg.file != nil {
+			msg.file.cleanup()
+		}
+		draft.inputErr = err
+		return
+	}
+	draft.insert(msg.text)
+}
+
+func (m *ui) sendDraft(key draftKey, draft *messageDraft) tea.Cmd {
+	if draft.file != nil && key.guid != "" {
+		draft.inputErr = errReplyAttachment
+		return nil
+	}
+	text := string(draft.text)
+	if m.writing || (draft.file == nil && strings.TrimSpace(text) == "") {
+		return nil
+	}
+	m.writing, m.sending, m.actionErr = true, draft, nil
+	draft.inputErr = nil
+	if draft.file != nil {
+		file := *draft.file
+		upload := &fileUpload{size: file.Size, updates: make(chan int64, 1)}
+		m.upload = upload
+		return tea.Batch(func() tea.Msg {
+			defer close(upload.updates)
+			return actionFinished{draft, m.b.sendFile(key.chatID, text, file, upload.report)}
+		}, func() tea.Msg { return upload.wait(m.done) })
+	}
+	return func() tea.Msg {
+		if key.guid != "" {
+			return actionFinished{draft, m.b.reply(key.chatID, key.guid, text)}
+		}
+		return actionFinished{draft, m.b.send(key.chatID, text)}
+	}
 }
 
 func moveIndex(key string, index, size, page int) int {
@@ -1163,23 +1345,43 @@ func (m *ui) footer() []string {
 			lines = append(lines, "Reply to "+m.replyContext)
 		}
 		draft := m.drafts[m.composeDraft]
-		before := strings.ReplaceAll(string(draft[:m.draftCursor]), "\n", "↵")
-		after := strings.ReplaceAll(string(draft[m.draftCursor:]), "\n", "↵")
-		before = ansi.TruncateLeft(before, max(0, ansi.StringWidth(before)-max(0, m.width-3)), "")
-		lines = append(lines, "> "+before+"▏"+after, "Enter Send   Esc Back")
+		prefix := "> "
+		keys := "Enter Send   Esc Back   Ctrl+V Paste"
+		if m.composeDraft.guid == "" {
+			keys += "   Ctrl+O Attach"
+		}
+		if draft.file != nil {
+			lines = append(lines, "Ctrl+X Remove: "+oneLine(draft.file.Name))
+			prefix = "Caption> "
+		}
+		before := strings.ReplaceAll(string(draft.text[:draft.cursor]), "\n", "↵")
+		after := strings.ReplaceAll(string(draft.text[draft.cursor:]), "\n", "↵")
+		before = ansi.TruncateLeft(before, max(0, ansi.StringWidth(before)-max(0, m.width-len(prefix)-1)), "")
+		lines = append(lines, prefix+before+"▏"+after)
+		lines = append(lines, strings.Split(ansi.Wrap(keys, m.width, ""), "\n")...)
 	case m.focus == uiReact:
 		lines = strings.Split(ansi.Wrap("1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
 	}
+	limit := max(1, m.height-2)
 	if status := m.status(); status != "" {
-		lines = append(lines, status)
+		lines = append(lines[:min(len(lines), limit-1)], status)
 	}
-	return lines[:min(len(lines), max(1, m.height-2))]
+	return lines[:min(len(lines), limit)]
 }
 
 func (m *ui) status() string {
 	switch {
 	case m.actionErr != nil:
 		return "Action: " + oneLine(m.actionErr.Error())
+	case m.upload != nil:
+		if m.upload.size > 0 && m.upload.sent >= m.upload.size {
+			return "Finishing upload. Waiting for send confirmation…"
+		}
+		return fmt.Sprintf("Uploading: %d / %d bytes", m.upload.sent, m.upload.size)
+	case m.focus == uiCompose && m.drafts[m.composeDraft].inputErr != nil:
+		return "Action: " + oneLine(m.drafts[m.composeDraft].inputErr.Error())
+	case m.focus == uiCompose && m.drafts[m.composeDraft].input != "":
+		return m.drafts[m.composeDraft].input
 	case m.chatsErr != nil:
 		return "Chats: " + oneLine(m.chatsErr.Error())
 	case m.historyErr != nil:
