@@ -33,6 +33,7 @@ type message struct {
 	Sender             string       `json:"sender"`
 	SenderName         string       `json:"sender_name"`
 	FromMe             bool         `json:"is_from_me"`
+	Editable           bool         `json:"-"`
 	CreatedAt          time.Time    `json:"created_at"`
 	UnsentAt           *time.Time   `json:"unsent_at"`
 	BalloonBundleID    string       `json:"balloon_bundle_id"`
@@ -241,6 +242,9 @@ func (b backend) history(id, limit int) ([]message, bool, error) {
 		if rows[i].UnsentAt != nil && rows[i].Text == "" && len(rows[i].Attachments) == 0 {
 			rows[i].Text = "[Unsent message]"
 		}
+	}
+	if err := b.loadEditEligibility(rows); err != nil {
+		return nil, false, err
 	}
 	if err := b.loadHistoryDetails(rows); err != nil {
 		return nil, false, err

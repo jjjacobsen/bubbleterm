@@ -20,6 +20,7 @@ const (
 	uiHistory
 	uiCompose
 	uiReact
+	uiEdit
 )
 
 const (
@@ -76,6 +77,15 @@ type actionFinished struct {
 	draft *messageDraft
 	err   error
 }
+
+type messageEdit struct {
+	target   draftKey
+	original string
+	created  time.Time
+	draft    messageDraft
+}
+
+type editFinished struct{ err error }
 
 type fileUpload struct {
 	size, sent int64
@@ -172,6 +182,7 @@ type ui struct {
 	drafts                          map[draftKey]*messageDraft
 	composeDraft                    draftKey
 	replyContext                    string
+	editor                          *messageEdit
 	clipboardRead                   *draftInput
 	sending                         *messageDraft
 	upload                          *fileUpload
@@ -309,9 +320,10 @@ func (m *ui) resetHistory() tea.Cmd {
 	clear(m.previews)
 	m.historyLimit, m.moreHistory = historyPageSize, false
 	m.rowIndex, m.rowTop, m.historyErr = 0, 0, nil
-	if m.focus == uiCompose || m.focus == uiReact {
+	if m.focus == uiCompose || m.focus == uiReact || m.focus == uiEdit {
 		m.focus = uiHistory
 	}
+	m.editor = nil
 	if len(m.chats) == 0 {
 		m.focus = uiChats
 	}
@@ -321,7 +333,7 @@ func (m *ui) resetHistory() tea.Cmd {
 func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
 		key := k.String()
-		if key == "ctrl+c" || (key == "q" && m.focus != uiCompose && m.search == nil) {
+		if key == "ctrl+c" || (key == "q" && m.focus != uiCompose && m.focus != uiEdit && m.search == nil) {
 			return m, tea.Quit
 		}
 	}
@@ -458,8 +470,8 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 			m.actionErr = msg.err
 		}
 	case shiftEnterMsg:
-		if m.focus == uiCompose {
-			return m.compose(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'\n'}})
+		if m.focus == uiCompose || m.focus == uiEdit {
+			return m.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'\n'}})
 		}
 		if m.focus == uiHistory && m.search == nil {
 			return m.copy(m.selectedLink())
@@ -482,6 +494,15 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 			m.upload.sent = msg.sent
 			return func() tea.Msg { return msg.upload.wait(m.done) }
 		}
+	case editFinished:
+		m.writing, m.actionErr = false, msg.err
+		if msg.err != nil {
+			return nil
+		}
+		if m.focus == uiEdit {
+			m.focus, m.editor = uiHistory, nil
+		}
+		return m.refresh()
 	case actionFinished:
 		m.writing, m.actionErr = false, msg.err
 		m.sending, m.upload = nil, nil
@@ -523,13 +544,16 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 	switch m.focus {
 	case uiCompose:
 		return m.compose(k)
+	case uiEdit:
+		return m.edit(k)
 	case uiReact:
-		if key == "esc" {
+		switch {
+		case key == "esc":
 			m.focus = uiHistory
-		} else if !m.writing && len(key) == 1 && key[0] >= '1' && key[0] <= '6' {
-			target, kind := m.target, tapbacks[key[0]-'1']
-			m.focus, m.writing, m.actionErr = uiHistory, true, nil
-			return func() tea.Msg { return actionFinished{err: m.b.react(id, target, kind)} }
+		case !m.writing && key == "7" && m.target.MyReaction != "":
+			return m.react(id, "remove")
+		case !m.writing && len(key) == 1 && key[0] >= '1' && key[0] <= '6':
+			return m.react(id, tapbacks[key[0]-'1'])
 		}
 	case uiChats:
 		switch key {
@@ -558,6 +582,10 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		case "R":
 			if len(m.rows) > 0 {
 				m.startReply(id, m.messages[m.rows[m.rowIndex].messageIndex])
+			}
+		case "e":
+			if !m.writing && len(m.rows) > 0 {
+				m.startEdit(id, m.messages[m.rows[m.rowIndex].messageIndex])
 			}
 		case "c", "C":
 			if len(m.rows) > 0 {
@@ -601,7 +629,7 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		case "r":
 			if !m.writing && len(m.rows) > 0 {
 				row := m.rows[m.rowIndex]
-				m.focus, m.target = uiReact, m.messages[row.messageIndex]
+				m.focus, m.target, m.actionErr = uiReact, m.messages[row.messageIndex], nil
 				if row.attachmentIndex >= 0 {
 					m.target.SelectedAttachment = &m.target.Attachments[row.attachmentIndex]
 				}
@@ -611,6 +639,12 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+func (m *ui) react(id int, kind string) tea.Cmd {
+	target := m.target
+	m.focus, m.writing, m.actionErr = uiHistory, true, nil
+	return func() tea.Msg { return actionFinished{err: m.b.react(id, target, kind)} }
 }
 
 func (m *ui) copy(text string) tea.Cmd {
@@ -754,6 +788,50 @@ func (m *ui) startReply(id int, item message) {
 	}
 }
 
+func (m *ui) startEdit(id int, item message) {
+	if !item.Editable || !item.withinEditWindow() {
+		m.actionErr = errors.New("select an editable iMessage you sent in the last 15 minutes")
+		return
+	}
+	text := []rune(item.Text)
+	m.editor = &messageEdit{
+		target: draftKey{chatID: id, guid: item.GUID}, original: item.Text, created: item.CreatedAt,
+		draft: messageDraft{text: text, cursor: len(text)},
+	}
+	m.focus, m.actionErr = uiEdit, nil
+}
+
+func (m *ui) edit(k tea.KeyMsg) tea.Cmd {
+	if m.writing {
+		return nil
+	}
+	editor := m.editor
+	switch k.Type {
+	case tea.KeyEsc, tea.KeyTab:
+		m.focus, m.editor, m.actionErr = uiHistory, nil, nil
+	case tea.KeyEnter:
+		text := string(editor.draft.text)
+		if text == editor.original {
+			m.focus, m.editor, m.actionErr = uiHistory, nil, nil
+			return nil
+		}
+		if strings.TrimSpace(text) == "" {
+			m.actionErr = errors.New("edited message cannot be empty")
+			return nil
+		}
+		if time.Since(editor.created) >= editWindow {
+			m.actionErr = errors.New("the 15-minute edit window has expired")
+			return nil
+		}
+		target := editor.target
+		m.writing, m.actionErr = true, nil
+		return func() tea.Msg { return editFinished{m.b.edit(target.chatID, target.guid, text)} }
+	default:
+		editor.draft.editText(k)
+	}
+	return nil
+}
+
 var errReplyAttachment = errors.New("thread replies do not support attachments")
 var errReplaceAttachment = errors.New("remove the attachment with Ctrl+X first")
 
@@ -767,7 +845,6 @@ func (m *ui) compose(k tea.KeyMsg) tea.Cmd {
 	if draft == m.sending || draft.input != "" {
 		return nil
 	}
-	cursor := draft.cursor
 	switch k.Type {
 	case tea.KeyEnter:
 		return m.sendDraft(key, draft)
@@ -808,6 +885,15 @@ func (m *ui) compose(k tea.KeyMsg) tea.Cmd {
 			draft.file.cleanup()
 			draft.file, draft.inputErr, m.actionErr = nil, nil, nil
 		}
+	default:
+		draft.editText(k)
+	}
+	return nil
+}
+
+func (draft *messageDraft) editText(k tea.KeyMsg) {
+	cursor := draft.cursor
+	switch k.Type {
 	case tea.KeyLeft:
 		draft.cursor = max(0, cursor-1)
 	case tea.KeyRight:
@@ -829,7 +915,6 @@ func (m *ui) compose(k tea.KeyMsg) tea.Cmd {
 			draft.insert(string(k.Runes))
 		}
 	}
-	return nil
 }
 
 func (m *ui) finishDraftInput(msg *draftInput) {
@@ -1412,6 +1497,12 @@ func (m *ui) footer() []string {
 		lines = append(lines, "Enter Open   / Search   p Pin/Unpin   ↑↓ Select   q Quit")
 	case m.focus == uiHistory:
 		keys := "/ Search   R Reply   c Copy   r React   i Compose   Esc Chats"
+		if len(m.rows) > 0 {
+			item := m.messages[m.rows[m.rowIndex].messageIndex]
+			if item.Editable && item.withinEditWindow() {
+				keys = "e Edit   " + keys
+			}
+		}
 		if m.moreHistory {
 			keys = "o Older   " + keys
 		}
@@ -1431,10 +1522,14 @@ func (m *ui) footer() []string {
 			keys = key + " Mark Read   " + keys
 		}
 		lines = append(lines, keys)
-	case m.focus == uiCompose:
+	case m.focus == uiCompose || m.focus == uiEdit:
 		return m.composeFooter(limit)
 	case m.focus == uiReact:
-		lines = strings.Split(ansi.Wrap("1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
+		remove := "No reaction to remove"
+		if m.target.MyReaction != "" {
+			remove = "7 Remove reaction"
+		}
+		lines = strings.Split(ansi.Wrap(remove+"  1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
 	}
 	if status := m.status(); status != "" {
 		lines = append(lines[:min(len(lines), limit-1)], status)
@@ -1444,6 +1539,9 @@ func (m *ui) footer() []string {
 
 func (m *ui) composeFooter(limit int) []string {
 	draft := m.drafts[m.composeDraft]
+	if m.focus == uiEdit {
+		draft = &m.editor.draft
+	}
 	status := m.status()
 	if limit == 1 {
 		status = ""
@@ -1451,7 +1549,7 @@ func (m *ui) composeFooter(limit int) []string {
 		limit--
 	}
 	var lines []string
-	if limit > 1 {
+	if limit > 1 && m.focus == uiCompose {
 		if m.composeDraft.guid != "" {
 			lines = append(lines, "Reply to "+m.replyContext)
 		} else if draft.file != nil {
@@ -1459,7 +1557,9 @@ func (m *ui) composeFooter(limit int) []string {
 		}
 	}
 	prefix := "> "
-	if draft.file != nil {
+	if m.focus == uiEdit {
+		prefix = "Edit> "
+	} else if draft.file != nil {
 		prefix = "Caption> "
 	}
 	if m.width <= len(prefix) {
@@ -1470,7 +1570,9 @@ func (m *ui) composeFooter(limit int) []string {
 	lines = append(lines, draft.visibleLines(prefix, m.width, draftHeight)...)
 	if len(lines) < limit {
 		keys := "Enter Send   Shift+Enter New Line   Esc Back   Ctrl+V Paste"
-		if m.composeDraft.guid == "" {
+		if m.focus == uiEdit {
+			keys = "Enter Save   Shift+Enter New Line   Esc Cancel"
+		} else if m.composeDraft.guid == "" {
 			keys += "   Ctrl+O Attach"
 		}
 		help := strings.Split(ansi.Wrap(keys, m.width, ""), "\n")
@@ -1483,10 +1585,10 @@ func (m *ui) composeFooter(limit int) []string {
 }
 
 func (d *messageDraft) visibleLines(prefix string, width, limit int) []string {
-	before := prefix + string(d.text[:d.cursor]) + "▏"
+	before := prefix + cleanText(string(d.text[:d.cursor])) + "▏"
 	lines := strings.Split(ansi.Hardwrap(before, width, true), "\n")
 	cursorRow := len(lines) - 1
-	tail := ansi.Hardwrap(lines[cursorRow]+string(d.text[d.cursor:]), width, true)
+	tail := ansi.Hardwrap(lines[cursorRow]+cleanText(string(d.text[d.cursor:])), width, true)
 	lines = append(lines[:cursorRow], strings.Split(tail, "\n")...)
 	top := scrollTop(0, cursorRow, limit, len(lines))
 	return lines[top:min(top+limit, len(lines))]

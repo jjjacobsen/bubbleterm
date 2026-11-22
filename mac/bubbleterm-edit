@@ -1,0 +1,218 @@
+#!/bin/sh
+set -eu
+
+# Load the sibling helper's JXA definitions, without its command dispatcher.
+shared=$(/usr/bin/awk '
+    NR <= 2 { next }
+    /^function run\(args\) \{/ { found = 1; exit }
+    { print }
+    END { if (!found) exit 1 }
+' "$(/usr/bin/dirname "$0")/bubbleterm-react")
+{
+    printf '%s\n' "$shared"
+    /bin/cat <<'JXA'
+ObjC.bindFunction('AXUIElementIsAttributeSettable', ['int', ['id', 'id', 'bool*']]);
+ObjC.bindFunction('AXUIElementSetAttributeValue', ['int', ['id', 'id', 'id']]);
+
+function latestEdit(summary) {
+    // The current edit is the last typedstream in the first part's edit history.
+    const input = '/usr/bin/printf %s ' + shellQuote(summary) + ' | /usr/bin/xxd -r -p';
+    const extract = key => input + ' | /usr/bin/plutil -extract ' + key + ' raw -o - -- -';
+    const count = Number(shell.doShellScript(extract('ec.0')));
+    if (!Number.isInteger(count) || count < 2 || count > 6) throw new Error('Unsupported iMessage edit history');
+    const typedstream = shell.doShellScript(extract('ec.0.' + (count - 1) + '.t') +
+        ' | /usr/bin/base64 -D | /usr/bin/xxd -p -u -c 256', { alteringLineEndings: false });
+    return { count, text: messageText({ text: null, body: typedstream.replace(/\s/g, '') }) };
+}
+
+function readEditTarget(chat, guid) {
+    const rows = query(`
+        SELECT c.guid AS chatGUID, CAST(m.ROWID AS TEXT) AS id,
+               m.date / 1000000000.0 + 978307200 AS seconds,
+               CAST(COALESCE(m.date_edited, 0) AS TEXT) AS revision,
+               hex(m.message_summary_info) AS summary, m.text, hex(m.attributedBody) AS body,
+               m.is_sent AS sent, m.is_finished AS finished, COALESCE(m.error, 0) AS error
+        FROM chat c JOIN chat_message_join j ON j.chat_id = c.ROWID
+        JOIN message m ON m.ROWID = j.message_id
+        WHERE c.ROWID = ${chat} AND m.guid COLLATE BINARY = ${guid}
+          AND m.service = 'iMessage' AND m.is_from_me = 1
+          AND c.guid <> '' AND (SELECT count(*) FROM chat WHERE guid COLLATE BINARY = c.guid) = 1
+          AND (SELECT count(*) FROM chat_message_join WHERE message_id = m.ROWID) = 1
+          AND COALESCE(m.associated_message_type, 0) = 0 AND COALESCE(m.is_system_message, 0) = 0
+          AND COALESCE(m.item_type, 0) = 0 AND COALESCE(m.date_retracted, 0) = 0
+          AND COALESCE(m.schedule_type, 0) = 0 AND COALESCE(m.cache_has_attachments, 0) = 0
+          AND COALESCE(m.is_audio_message, 0) = 0 AND COALESCE(m.subject, '') = ''
+          AND m.balloon_bundle_id IS NULL AND m.part_count = 1
+          AND NOT EXISTS (SELECT 1 FROM message_attachment_join WHERE message_id = m.ROWID)`);
+    if (rows.length !== 1 || !rows[0].sent || !rows[0].finished || rows[0].error) {
+        throw new Error('Target must be a sent, single-part outgoing iMessage without attachments');
+    }
+    return rows[0];
+}
+
+function requireEditAge(row) {
+    const age = Date.now() / 1000 - row.seconds;
+    if (!row.seconds || age < 0 || age >= 15 * 60) throw new Error('iMessage is outside the 15-minute edit window');
+}
+
+function requireUniqueEditText(chat, guid, target) {
+    // AX exposes the text and clock time but no message GUID or date. Check all dates in this chat.
+    const needle = sqlQuote(target.text);
+    const candidates = query(`
+        SELECT m.date / 1000000000.0 + 978307200 AS seconds,
+               m.text, hex(m.attributedBody) AS body, hex(m.message_summary_info) AS summary,
+               COALESCE(m.date_edited, 0) <> 0 AS edited
+        FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
+        WHERE j.chat_id = ${chat} AND m.guid COLLATE BINARY <> ${guid}
+          AND m.is_from_me IS NOT 0 AND COALESCE(m.associated_message_type, 0) = 0
+          AND (COALESCE(m.date_edited, 0) <> 0 OR m.text COLLATE BINARY = ${needle}
+               OR instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0)
+          AND strftime('%M', m.date / 1000000000 + 978307200, 'unixepoch', 'localtime') =
+              strftime('%M', ${Math.floor(target.seconds)}, 'unixepoch', 'localtime')`);
+    if (candidates.some(row => clock(row.seconds) === target.time && (row.edited
+        ? latestEdit(row.summary).text === target.text
+        : row.text === target.text || messageText({ text: null, body: row.body }).split('\ufffc').includes(target.text)))) {
+        throw new Error('Text and clock time do not identify a unique outgoing balloon in this chat');
+    }
+}
+
+function editButtons(root, label) {
+    return find(root, el => role(el) === 'AXButton' &&
+        (value(el, 'AXDescription') === label || value(el, 'AXTitle') === label),
+        el => ['ConversationList', 'MessageEntryView'].includes(identifier(el)));
+}
+
+function editOrigin(context, target) {
+    const window = context.focusedWindow();
+    if (!window || !$.CFEqual(window, context.window)) throw new Error('Messages switched chats or windows');
+    const views = find(window, el => identifier(el) === transcriptID);
+    if (views.length !== 1 || value(views[0], 'AXDescription') !== 'Messages' ||
+        editButtons(window, 'Cancel edit').length || editButtons(window, 'Send edit').length) {
+        throw new Error('Close any open edit or reply in Messages first');
+    }
+    const view = views[0];
+    const matches = targetBalloons(view, target);
+    if (matches.length !== 1) throw new Error('Cannot verify the target message balloon');
+    const owner = attr(matches[0], 'AXParent');
+    const row = owner && attr(owner, 'AXParent');
+    const description = row && value(row, 'AXDescription');
+    const rows = children(view);
+    const index = row ? rows.findIndex(el => $.CFEqual(el, row)) : -1;
+    if (index < 0 || !description || !description.startsWith('Your iMessage, ') || !description.endsWith(', ' + target.time)) {
+        throw new Error('Cannot verify the outgoing balloon and its clock time');
+    }
+    return { ...context, view, rows, index };
+}
+
+function editComposer(context) {
+    const window = context.focusedWindow();
+    if (!window || !$.CFEqual(window, context.window)) return null;
+    const views = find(window, el => identifier(el) === transcriptID);
+    if (views.length !== 1 || !$.CFEqual(views[0], context.view)) return null;
+    const rows = children(views[0]);
+    const field = attr(context.app, 'AXFocusedUIElement');
+    if (!field || !['AXTextArea', 'AXTextField'].includes(role(field)) ||
+        identifier(field) === 'messageBodyField' || !value(field, 'AXEnabled')) return null;
+    let row = field;
+    for (;;) {
+        const parent = attr(row, 'AXParent');
+        if (!parent || $.CFEqual(parent, window)) return null;
+        if ($.CFEqual(parent, views[0])) break;
+        row = parent;
+    }
+    // The native editor can replace its balloon row. Require the same slot and unchanged neighbors.
+    if (!$.CFEqual(row, context.rows[context.index]) && (rows.length !== context.rows.length ||
+        !$.CFEqual(row, rows[context.index]) || context.rows.some((el, i) => i !== context.index && !$.CFEqual(el, rows[i])))) {
+        return null;
+    }
+    const submit = editButtons(row, 'Send edit');
+    const cancel = editButtons(row, 'Cancel edit');
+    if (submit.length !== 1 || cancel.length !== 1 || !hasAction(submit[0], 'AXPress')) return null;
+    return { field, submit: submit[0] };
+}
+
+function openEdit(target, requireOriginal) {
+    // The context menu uses English Edit on current macOS. Also accept the ellipsis form.
+    for (const itemID of ['edit', 'edit…']) {
+        let choseItem = false;
+        try {
+            return withTargetMenu(target, itemID, '--check', (item, context) => {
+                requireOriginal();
+                const editorContext = editOrigin(context, target);
+                if (!['Edit', 'Edit…'].includes(value(item, 'AXTitle'))) throw new Error('Cannot verify the Edit menu item');
+                choseItem = true;
+                const status = $.AXUIElementPerformAction(item, 'AXPress');
+                if (status !== 0 && status !== -25204) throw new Error('Cannot choose Edit (AX error ' + status + ')');
+                return editorContext;
+            });
+        } catch (error) {
+            if (choseItem || itemID === 'edit…' || error.message !== 'The requested Messages menu item is not available') throw error;
+        }
+    }
+}
+
+function run(args) {
+    const [chat, guid, text] = args;
+    if (args.length !== 3 || !/^[1-9][0-9]{0,18}$/.test(chat) || (chat.length === 19 && chat > '9223372036854775807') ||
+        !guid || !text.trim() || /[\x00\ufffc\ufffd]/.test(text)) {
+        throw new Error('Usage: bubbleterm-edit CHAT_ID GUID NEW_TEXT');
+    }
+    const key = sqlQuote(guid);
+    const row = readEditTarget(chat, key);
+    requireEditAge(row);
+    const history = row.revision === '0' ? { count: 1, text: messageText(row) } : latestEdit(row.summary);
+    if (history.count >= 6) throw new Error('iMessage already has five edits');
+    if (!history.text || !history.text.trim() || /[\x00\ufffc\ufffd]/.test(history.text)) throw new Error('Target has no usable text');
+    if (history.text === text) throw new Error('New text is the same as the current iMessage');
+    const target = { ...row, text: history.text, time: clock(row.seconds) };
+    const requireOriginal = () => {
+        const now = readEditTarget(chat, key);
+        requireEditAge(now);
+        if (now.id !== row.id || now.chatGUID !== row.chatGUID || now.seconds !== row.seconds || now.revision !== row.revision ||
+            now.text !== row.text || now.body !== row.body || now.summary !== row.summary) {
+            throw new Error('The original iMessage changed');
+        }
+    };
+    requireUniqueEditText(chat, key, target);
+    const context = openEdit(target, requireOriginal);
+    try {
+        const probe = () => editComposer(context);
+        const current = waitFor(probe, 3);
+        if (!current || value(current.field, 'AXValue') !== target.text) {
+            throw new Error('Cannot verify the native editor for the exact outgoing iMessage');
+        }
+        const settable = Ref();
+        if ($.AXUIElementIsAttributeSettable(current.field, 'AXValue', settable) !== 0 || !settable[0]) {
+            throw new Error('Cannot set text in the native iMessage editor');
+        }
+        const sameEditor = expected => {
+            const editor = probe();
+            return editor && $.CFEqual(editor.field, current.field) && $.CFEqual(editor.submit, current.submit) &&
+                value(editor.field, 'AXValue') === expected;
+        };
+        requireOriginal();
+        if (!sameEditor(target.text)) throw new Error('The edit composer changed before text entry');
+        const entered = $.AXUIElementSetAttributeValue(current.field, 'AXValue', $(text));
+        if (entered !== 0) throw new Error('Cannot set edit text (AX error ' + entered + ')');
+        requireOriginal();
+        if (!sameEditor(text) || !value(current.submit, 'AXEnabled')) throw new Error('Cannot verify the edit text and confirmation button');
+        // Press only the native edit button, once. Never send a Return event.
+        const status = $.AXUIElementPerformAction(current.submit, 'AXPress');
+        const recorded = waitFor(() => {
+            const edited = readEditTarget(chat, key);
+            if (edited.id !== row.id || edited.chatGUID !== row.chatGUID) throw new Error('Original iMessage identity changed');
+            if (edited.revision === row.revision) return null;
+            const last = latestEdit(edited.summary);
+            if (BigInt(edited.revision) <= BigInt(row.revision) || last.count !== history.count + 1 || last.text !== text) {
+                throw new Error('The original iMessage has an unexpected edit');
+            }
+            return guid;
+        }, 10);
+        if (!recorded) throw new Error('No matching edit was recorded on the original iMessage (AX result ' + status + ')');
+        return recorded;
+    } catch (error) {
+        throw new Error(error.message + '. Check Messages before retrying');
+    }
+}
+JXA
+} | /usr/bin/osascript -l JavaScript - "$@"

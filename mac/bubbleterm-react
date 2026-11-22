@@ -355,44 +355,92 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
 function react(args) {
     const mode = ['--check', '--dry-run'].includes(args[0]) ? args.shift() : null;
     const [chat, guid, kind, option, filename] = args;
+    const removing = kind === 'remove';
     const reaction = tapbacks.findIndex(entry => entry[0] === kind);
     if ((args.length !== 3 && !(args.length === 5 && option === '--attachment' && filename)) ||
-        !/^[1-9][0-9]{0,18}$/.test(chat) || (chat.length === 19 && chat > '9223372036854775807') || !guid || reaction < 0) {
-        throw new Error('Usage: bubbleterm-react [--check|--dry-run] CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question [--attachment FILENAME]');
+        !/^[1-9][0-9]{0,18}$/.test(chat) || (chat.length === 19 && chat > '9223372036854775807') || !guid ||
+        (!removing && reaction < 0)) {
+        throw new Error('Usage: bubbleterm-react [--check|--dry-run] CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question|remove [--attachment FILENAME]');
     }
     const target = resolveTarget(chat, sqlQuote(guid), filename);
-    const itemID = tapbacks[reaction][1];
-    if (mode) return withTargetMenu(target, itemID, mode, () => 'Tapback target verified. No reaction sent.');
-    const type = 2000 + reaction;
+    if (!removing && mode) return withTargetMenu(target, tapbacks[reaction][1], mode, () => 'Tapback target verified. No reaction sent.');
+    if (removing && !target.kind && target.parts !== target.part + 1) {
+        throw new Error('Cannot isolate the selected text part');
+    }
+    const lastKind = removing ? 7 : 6;
     const lowerGUID = guid.toLowerCase();
     const partGUID = 'p:' + target.part + '/' + lowerGUID;
     // Synced reactions may be linked to a different chat but still address this exact GUID.
     const events = (after = 0) => query(`
         SELECT guid, lower(associated_message_guid) AS target, associated_message_type AS type
+               ${removing ? ', associated_message_emoji AS emoji' : ''}
         FROM message
         WHERE is_from_me = 1 AND COALESCE(error, 0) = 0 AND ROWID > ${after}
-          AND (associated_message_type BETWEEN 2000 AND 2006 OR associated_message_type BETWEEN 3000 AND 3006)
+          AND (associated_message_type BETWEEN 2000 AND ${2000 + lastKind}
+               OR associated_message_type BETWEEN 3000 AND ${3000 + lastKind})
           AND (lower(associated_message_guid) IN (${sqlQuote(lowerGUID)}, ${sqlQuote('bp:' + lowerGUID)})
                OR (substr(lower(associated_message_guid), 1, 2) = 'p:'
                    AND lower(substr(associated_message_guid, instr(associated_message_guid, '/') + 1)) = ${sqlQuote(lowerGUID)}))
-        ORDER BY date, ROWID`).filter(row => row.target === lowerGUID || row.target.replace(/^(?:p:[0-9]+\/|bp:)/, '') === lowerGUID);
+        ORDER BY date, ROWID`).filter(row => {
+        const valid = row.target === lowerGUID || row.target === 'bp:' + lowerGUID ||
+            row.target.replace(removing ? /^p:(?:0|[1-9][0-9]*)\// : /^p:[0-9]+\//, '') === lowerGUID;
+        if (removing && !valid) throw new Error('An existing tapback does not identify a part');
+        return valid;
+    });
     const onPart = row => row.target === partGUID || (target.part === 0 && (
         (row.target === lowerGUID && (!target.kind || target.parts === 1)) ||
         (row.target === 'bp:' + lowerGUID && !target.kind)
     ));
-    const prior = events();
-    if (prior.some(row => !row.target.startsWith('p:') && !onPart(row))) {
-        throw new Error('An existing tapback does not identify a part');
+    const activeTapback = () => {
+        const prior = events();
+        if (prior.some(row => !row.target.startsWith('p:') && !onPart(row))) {
+            throw new Error('An existing tapback does not identify a part');
+        }
+        let active = null;
+        for (const row of prior.filter(onPart)) {
+            if (row.type < 3000) active = row;
+            else if (active && row.type === active.type + 1000 &&
+                (row.type !== 3006 || !row.emoji || row.emoji === active.emoji)) active = null;
+        }
+        return active;
+    };
+    const active = activeTapback();
+    const lastRow = () => query('SELECT CAST(COALESCE(max(ROWID), 0) AS TEXT) AS id FROM message')[0].id;
+    if (removing) {
+        if (!active) throw new Error('No active outgoing Tapback on the selected part');
+        const entry = tapbacks[active.type - 2000];
+        if (!entry) throw new Error('Cannot remove custom emoji or sticker Tapbacks');
+        return withTargetMenu(target, entry[1], mode, item => {
+            const after = lastRow();
+            if (activeTapback()?.guid !== active.guid) throw new Error('The active Tapback changed before removal');
+            // A menu highlight can follow the pointer. Only a checkmark confirms the toggle state.
+            if (value(item, 'AXMenuItemMarkChar') !== '\u2713') throw new Error('Messages did not mark the Tapback as active');
+            if (mode) return 'Active Tapback verified. No reaction removed.';
+            // Press once, even if AX reports an error or the database is slow to update.
+            try {
+                const status = $.AXUIElementPerformAction(item, 'AXPress');
+                const recorded = waitFor(() => {
+                    const changes = events(after);
+                    if (changes.length > 1) throw new Error('More than one Tapback change was recorded on the target');
+                    const [removed] = changes;
+                    if (!removed) return null;
+                    if (!onPart(removed) || removed.type !== active.type + 1000) {
+                        throw new Error('The recorded Tapback change did not match the requested removal');
+                    }
+                    return !activeTapback() && removed.guid;
+                }, 5);
+                if (recorded) return recorded;
+                throw new Error('No matching outgoing Tapback removal was recorded (AX result ' + status + ')');
+            } catch (error) {
+                throw new Error(error.message + '. Check Messages before retrying');
+            }
+        });
     }
-    let active = null;
-    for (const row of prior.filter(onPart)) {
-        if (row.type < 3000) active = row;
-        else if (active && row.type === active.type + 1000) active = null;
-    }
-    if (active && active.type === type) return active.guid;
 
-    const after = query('SELECT CAST(COALESCE(max(ROWID), 0) AS TEXT) AS id FROM message')[0].id;
-    return withTargetMenu(target, itemID, null, item => {
+    const type = 2000 + reaction;
+    if (active && active.type === type) return active.guid;
+    const after = lastRow();
+    return withTargetMenu(target, tapbacks[reaction][1], null, item => {
         // Never press again: even a failed AX call can have applied the tapback.
         try {
             const status = $.AXUIElementPerformAction(item, 'AXPress');
