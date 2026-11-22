@@ -71,8 +71,9 @@ type sshSession struct {
 	cancel context.CancelFunc
 	dir    string
 
-	mu      sync.Mutex
-	started bool
+	mu                    sync.Mutex
+	started               bool
+	notificationDirectory notificationDirectory
 }
 
 func (b backend) session() (*sshSession, error) {
@@ -219,6 +220,9 @@ func (b backend) chats() ([]chat, map[int]bool, error) {
 	chats, err := readRows[chat](b, "list chats", "chats --limit 100 --json")
 	if err != nil {
 		return nil, nil, err
+	}
+	if s, err := b.session(); err == nil {
+		s.notificationDirectory.updateChats(chats)
 	}
 	unread, err := b.unreadChats()
 	if err != nil {
