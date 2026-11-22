@@ -215,15 +215,19 @@ func readRows[T any](b backend, op, remote string) ([]T, error) {
 	}
 }
 
-func (b backend) chats() ([]chat, error) {
+func (b backend) chats() ([]chat, map[int]bool, error) {
 	chats, err := readRows[chat](b, "list chats", "chats --limit 100 --json")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := b.loadUnread(chats); err != nil {
-		return nil, err
+	unread, err := b.unreadChats()
+	if err != nil {
+		return nil, nil, err
 	}
-	return chats, nil
+	for i := range chats {
+		chats[i].Unread = unread[chats[i].ID]
+	}
+	return chats, unread, nil
 }
 
 func (b backend) history(id, limit int) ([]message, bool, error) {

@@ -36,6 +36,10 @@ type paneSearch struct {
 	chatLabels  map[int]string
 }
 
+func (m *ui) searchingChats() bool {
+	return m.focus == uiChats || m.focus == uiHidden
+}
+
 func (m *ui) startSearch() {
 	m.search = &paneSearch{active: -1, spans: make(map[int][]searchSpan), chatLabels: make(map[int]string)}
 }
@@ -49,9 +53,12 @@ func (m *ui) searchKey(k tea.KeyMsg) tea.Cmd {
 		m.search = nil
 		if s.active >= 0 {
 			hit := s.hits[s.active]
-			if m.focus == uiHistory {
+			switch m.focus {
+			case uiHistory:
 				m.rowTop, m.rowIndex = s.top, hit.first
-			} else {
+			case uiHidden:
+				m.hiddenTop, m.hiddenIndex = s.top, hit.first
+			case uiChats:
 				m.chatTop = s.top
 				if hit.first != m.chatIndex {
 					m.chatIndex = hit.first
@@ -112,10 +119,14 @@ func (m *ui) updateSearch() {
 	}
 	pattern := regexp.MustCompile("(?i)" + regexp.QuoteMeta(string(s.query)))
 	index := m.rowIndex
-	if m.focus == uiChats {
+	switch m.focus {
+	case uiChats:
 		index = m.chatIndex
-		m.matchChats(pattern)
-	} else {
+		m.matchChats(pattern, m.chats)
+	case uiHidden:
+		index = m.hiddenIndex
+		m.matchChats(pattern, m.hidden.chats)
+	default:
 		m.matchHistory(pattern)
 	}
 	if len(s.hits) == 0 {
@@ -131,9 +142,9 @@ func (m *ui) updateSearch() {
 	}
 }
 
-func (m *ui) matchChats(pattern *regexp.Regexp) {
+func (m *ui) matchChats(pattern *regexp.Regexp, chats []chat) {
 	s := m.search
-	for i, c := range m.chats {
+	for i, c := range chats {
 		name := chatName(c)
 		for _, field := range []string{name, oneLine(c.Name), oneLine(c.Identifier), strconv.Itoa(c.ID)} {
 			matches := pattern.FindAllStringIndex(field, -1)
@@ -193,15 +204,21 @@ func (m *ui) keepSearchVisible(height int) {
 	s := m.search
 	if s.active < 0 {
 		s.top = m.rowTop
-		if m.focus == uiChats {
+		switch m.focus {
+		case uiChats:
 			s.top = m.chatTop
+		case uiHidden:
+			s.top = m.hiddenTop
 		}
 		return
 	}
 	hit := s.hits[s.active]
-	if m.focus == uiChats {
+	switch m.focus {
+	case uiChats:
 		s.top = m.scrollChats(s.top, hit.first, height)
-	} else {
+	case uiHidden:
+		s.top = scrollTop(s.top, hit.first, height, len(m.hidden.chats))
+	default:
 		s.top = scrollTop(s.top, hit.first, height, len(m.rows))
 		if hit.last-hit.first < height {
 			s.top = max(s.top, hit.last-height+1)

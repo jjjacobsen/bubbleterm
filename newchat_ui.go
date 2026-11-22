@@ -10,6 +10,8 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+var errHiddenChat = errors.New("chat is hidden. Unhide it with H then h first")
+
 type newChatModal struct {
 	directory  *directory
 	query      messageDraft
@@ -56,8 +58,17 @@ func (m *ui) finishDirectory(msg directoryLoaded) {
 		m.newChat.err = fmt.Errorf("load recipients: %w", msg.err)
 		return
 	}
+	var older []chat
+	for _, c := range msg.dir.chats {
+		if m.hidden.contains(c.chat) && chatIndex(m.latestChats, c.ID) < 0 {
+			older = append(older, c.chat)
+		}
+	}
+	if err := m.hidden.refresh(older); err != nil {
+		m.actionErr = fmt.Errorf("refresh hidden chats: %w", err)
+	}
 	m.newChat.directory = &msg.dir
-	m.newChat.updateOptions()
+	m.newChat.updateOptions(m.hidden)
 }
 
 func (m *ui) newChatKey(k tea.KeyMsg) tea.Cmd {
@@ -102,7 +113,7 @@ func (m *ui) newChatKey(k tea.KeyMsg) tea.Cmd {
 	case tea.KeyBackspace:
 		if len(s.query.text) == 0 && len(s.recipients) > 0 {
 			s.recipients = s.recipients[:len(s.recipients)-1]
-			s.updateOptions()
+			s.updateOptions(m.hidden)
 			return nil
 		}
 		fallthrough
@@ -113,25 +124,20 @@ func (m *ui) newChatKey(k tea.KeyMsg) tea.Cmd {
 		}
 		s.query.editText(k)
 		if len(s.query.text) != before && s.directory != nil {
-			s.updateOptions()
+			s.updateOptions(m.hidden)
 		}
 	}
 	return nil
 }
 
-func (s *newChatModal) updateOptions() {
+func (s *newChatModal) updateOptions(hidden *chatStore) {
 	s.active, s.options, s.err = -1, nil, nil
 	query := strings.TrimSpace(string(s.query.text))
 	if query == "" {
 		return
 	}
-	options := s.directory.suggestions(query)
-	if len(s.recipients) == 0 {
-		s.options = options
-		return
-	}
-	for _, option := range options {
-		if option.Chat == nil {
+	for _, option := range s.directory.suggestions(query) {
+		if option.Chat == nil || len(s.recipients) == 0 && !hidden.contains(*option.Chat) {
 			s.options = append(s.options, option)
 		}
 	}
@@ -213,7 +219,7 @@ func (m *ui) useRecipient(option recipientOption) tea.Cmd {
 	}
 	s.recipients = append(s.recipients, option)
 	s.query = messageDraft{}
-	s.updateOptions()
+	s.updateOptions(m.hidden)
 	return nil
 }
 
@@ -240,10 +246,10 @@ func (m *ui) sendFirstMessage() tea.Cmd {
 		s.err = errors.New("another action is still in progress")
 		return nil
 	}
-	addresses := s.addresses()
+	addresses, hidden := s.addresses(), m.hidden.chats
 	s.sending, s.err, m.writing = true, nil, true
 	return func() tea.Msg {
-		c, err := m.b.startChat(addresses, text)
+		c, err := m.b.startChat(addresses, text, hidden)
 		return newChatStarted{c, err}
 	}
 }
@@ -260,9 +266,13 @@ func (m *ui) finishNewChat(msg newChatStarted) tea.Cmd {
 }
 
 func (m *ui) openDirectoryChat(c chat) tea.Cmd {
+	if m.hidden.contains(c) {
+		m.newChat.err = errHiddenChat
+		return nil
+	}
 	m.newChat, m.openedChat, m.focus, m.actionErr = nil, &c, uiHistory, nil
 	m.rebuildChats()
-	m.chatIndex = slices.IndexFunc(m.chats, func(item chat) bool { return item.ID == c.ID })
+	m.chatIndex = chatIndex(m.chats, c.ID)
 	history := m.resetHistory()
 	m.requestViewChat()
 	return history

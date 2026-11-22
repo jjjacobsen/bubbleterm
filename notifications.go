@@ -19,6 +19,7 @@ type desktopNotifications struct {
 
 type watchEvent struct {
 	ID          int64        `json:"id"`
+	ChatID      int          `json:"chat_id"`
 	CreatedAt   time.Time    `json:"created_at"`
 	FromMe      *bool        `json:"is_from_me"`
 	Type        string       `json:"type"`
@@ -32,7 +33,7 @@ type watchEvent struct {
 	Attachments []attachment `json:"attachments"`
 }
 
-func (n *desktopNotifications) onWatch() func(context.Context, json.RawMessage) {
+func (n *desktopNotifications) onWatch(isHidden func(int) bool) func(context.Context, json.RawMessage) {
 	command, err := exec.LookPath("notify-send")
 	if err != nil {
 		return nil
@@ -52,6 +53,9 @@ func (n *desktopNotifications) onWatch() func(context.Context, json.RawMessage) 
 		}
 		// New rows arrive in ID order. Keep this cursor across watch reconnects.
 		n.lastID = event.ID
+		if event.ChatID == 0 || isHidden(event.ChatID) {
+			return
+		}
 		go sendNotification(ctx, command, summary, body)
 	}
 }

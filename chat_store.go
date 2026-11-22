@@ -8,14 +8,16 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 )
 
-type pins struct {
+type chatStore struct {
 	file  string
+	mu    sync.RWMutex // protects publication to the watch goroutine
 	chats []chat
 }
 
-func newPins(host string) (*pins, error) {
+func newChatStore(host, kind string) (*chatStore, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return nil, err
@@ -29,10 +31,10 @@ func newPins(host string) (*pins, error) {
 		return nil, err
 	}
 	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return nil, fmt.Errorf("pin directory is not private: %s", dir)
+		return nil, fmt.Errorf("chat store directory is not private: %s", dir)
 	}
 
-	p := &pins{file: filepath.Join(dir, fmt.Sprintf("pins-%x.json", sha256.Sum256([]byte(host))))}
+	p := &chatStore{file: filepath.Join(dir, fmt.Sprintf("%s-%x.json", kind, sha256.Sum256([]byte(host))))}
 	info, err = os.Lstat(p.file)
 	if errors.Is(err, os.ErrNotExist) {
 		return p, nil
@@ -41,36 +43,64 @@ func newPins(host string) (*pins, error) {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return nil, fmt.Errorf("pin file is not a private regular file: %s", p.file)
+		return nil, fmt.Errorf("chat store is not a private regular file: %s", p.file)
 	}
 	data, err := os.ReadFile(p.file)
 	if err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal(data, &p.chats); err != nil {
-		return nil, fmt.Errorf("decode pins from %s: %w", p.file, err)
+		return nil, fmt.Errorf("decode chat store %s: %w", p.file, err)
 	}
 	return p, nil
 }
 
-func (p *pins) index(c chat) int {
-	return slices.IndexFunc(p.chats, func(pin chat) bool { return pin.ID == c.ID })
+func chatIndex(chats []chat, id int) int {
+	return slices.IndexFunc(chats, func(c chat) bool { return c.ID == id })
 }
 
-func (p *pins) contains(c chat) bool {
-	return p.index(c) >= 0
+func (p *chatStore) contains(c chat) bool {
+	return p.containsID(c.ID)
 }
 
-func (p *pins) toggle(c chat) error {
+func (p *chatStore) containsID(id int) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return chatIndex(p.chats, id) >= 0
+}
+
+func (p *chatStore) toggle(c chat) error {
 	chats := slices.Clone(p.chats)
-	if i := p.index(c); i >= 0 {
+	if i := chatIndex(chats, c.ID); i >= 0 {
 		chats = slices.Delete(chats, i, i+1)
 	} else {
 		c.Unread = false
 		chats = append(chats, c)
 	}
 
-	out, err := os.CreateTemp(filepath.Dir(p.file), ".pins-*")
+	return p.save(chats)
+}
+
+func (p *chatStore) refresh(current []chat) error {
+	var chats []chat
+	for _, c := range current {
+		i := chatIndex(p.chats, c.ID)
+		c.Unread = false
+		if i >= 0 && c != p.chats[i] {
+			if chats == nil {
+				chats = slices.Clone(p.chats)
+			}
+			chats[i] = c
+		}
+	}
+	if chats != nil {
+		return p.save(chats)
+	}
+	return nil
+}
+
+func (p *chatStore) save(chats []chat) error {
+	out, err := os.CreateTemp(filepath.Dir(p.file), ".chat-store-*")
 	if err != nil {
 		return err
 	}
@@ -82,11 +112,13 @@ func (p *pins) toggle(c chat) error {
 	if err := os.Rename(out.Name(), p.file); err != nil {
 		return err
 	}
+	p.mu.Lock()
 	p.chats = chats
+	p.mu.Unlock()
 	return nil
 }
 
-func (p *pins) order(latest []chat) []chat {
+func (p *chatStore) order(latest []chat) []chat {
 	if len(p.chats) == 0 {
 		return latest
 	}

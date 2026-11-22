@@ -11,7 +11,7 @@ import (
 
 var errNewChatUncertain = errors.New("send outcome unknown. Check Messages before retrying")
 
-func (b backend) startChat(addresses []string, text string) (chat, error) {
+func (b backend) startChat(addresses []string, text string, hidden []chat) (chat, error) {
 	if strings.TrimSpace(text) == "" || strings.ContainsRune(text, '\x00') {
 		return chat{}, errors.New("enter a non-empty text message without NUL bytes")
 	}
@@ -33,6 +33,9 @@ func (b backend) startChat(addresses []string, text string) (chat, error) {
 	}
 	body := " " + shellQuote("--text="+text)
 	if found {
+		if chatIndex(hidden, target.ID) >= 0 {
+			return chat{}, errHiddenChat
+		}
 		_, err := b.newChatSend(fmt.Sprintf("send --chat-id %d", target.ID) + body)
 		return target, err
 	}

@@ -18,27 +18,24 @@ WHERE m.is_read = 0 AND m.is_from_me = 0 AND m.item_type = 0
   AND m.is_finished = 1 AND m.is_system_message = 0 AND j.filter_action = 0
   AND m.date > c.last_read_message_timestamp`
 
-func (b backend) loadUnread(chats []chat) error {
+func (b backend) unreadChats() (map[int]bool, error) {
 	out, err := b.read("read unread state", queryMessagesDB+shellQuote(unreadChatsQuery))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var rows []struct {
 		ID int `json:"id"`
 	}
 	if len(out) > 0 {
 		if err := json.Unmarshal(out, &rows); err != nil {
-			return fmt.Errorf("decode unread state: %w", err)
+			return nil, fmt.Errorf("decode unread state: %w", err)
 		}
 	}
 	unread := make(map[int]bool, len(rows))
 	for _, row := range rows {
 		unread[row.ID] = true
 	}
-	for i := range chats {
-		chats[i].Unread = unread[chats[i].ID]
-	}
-	return nil
+	return unread, nil
 }
 
 const viewChatQuery = `

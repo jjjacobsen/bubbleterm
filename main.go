@@ -17,6 +17,7 @@ import (
 
 const (
 	uiChats = iota
+	uiHidden
 	uiHistory
 	uiCompose
 	uiReact
@@ -33,8 +34,9 @@ const (
 var tapbacks = [...]string{"love", "like", "dislike", "laugh", "emphasis", "question"}
 
 type chatsLoaded struct {
-	chats []chat
-	err   error
+	chats  []chat
+	unread map[int]bool
+	err    error
 }
 
 type historyLoaded struct {
@@ -168,10 +170,13 @@ type ui struct {
 
 	width, height                   int
 	focus                           int
-	pins                            *pins
+	pins, hidden                    *chatStore
 	latestChats, chats              []chat
-	openedChat                      *chat // keep a chat opened outside the recent list
+	unreadChats                     map[int]bool
+	openedChat                      *chat  // keep a chat opened outside the recent list
+	restoredChats                   []chat // keep older unhidden chats available for this session
 	pinnedCount, chatIndex, chatTop int
+	hiddenIndex, hiddenTop          int
 	viewPending, viewing            int // chat IDs of queued and running opens
 	viewErr                         error
 	terminalBlurred                 bool
@@ -211,14 +216,18 @@ func main() {
 }
 
 func runUI(b *backend) error {
-	p, err := newPins(b.host)
+	pins, err := newChatStore(b.host, "pins")
 	if err != nil {
 		return fmt.Errorf("load pinned chats: %w", err)
+	}
+	hidden, err := newChatStore(b.host, "hidden")
+	if err != nil {
+		return fmt.Errorf("load hidden chats: %w", err)
 	}
 	done := make(chan struct{})
 	g := newGraphics()
 	defer g.close()
-	m := &ui{b: b, g: g, events: make(chan struct{}, 1), done: done, pins: p, drafts: make(map[draftKey]*messageDraft)}
+	m := &ui{b: b, g: g, events: make(chan struct{}, 1), done: done, pins: pins, hidden: hidden, drafts: make(map[draftKey]*messageDraft)}
 	defer func() {
 		close(done)
 		m.cleanupDrafts()
@@ -261,7 +270,7 @@ func (m *ui) watch() tea.Cmd {
 			case m.events <- struct{}{}:
 			default:
 			}
-		}, m.notifications.onWatch())}
+		}, m.notifications.onWatch(m.hidden.containsID))}
 	}
 }
 
@@ -288,13 +297,13 @@ func (m *ui) loadChats() tea.Cmd {
 	}
 	m.chatsBusy, m.chatsAgain = true, false
 	return func() tea.Msg {
-		chats, err := m.b.chats()
-		return chatsLoaded{chats, err}
+		chats, unread, err := m.b.chats()
+		return chatsLoaded{chats, unread, err}
 	}
 }
 
 func (m *ui) loadHistory() tea.Cmd {
-	if len(m.chats) == 0 {
+	if m.focus == uiHidden || len(m.chats) == 0 {
 		return nil
 	}
 	if m.historyBusy {
@@ -302,6 +311,9 @@ func (m *ui) loadHistory() tea.Cmd {
 		return nil
 	}
 	m.historyBusy, m.historyAgain = true, false
+	if m.historyLimit == 0 {
+		m.historyLimit = historyPageSize
+	}
 	id, limit := m.chats[m.chatIndex].ID, m.historyLimit
 	return func() tea.Msg {
 		messages, more, err := m.b.history(id, limit)
@@ -314,22 +326,26 @@ func (m *ui) refresh() tea.Cmd {
 }
 
 func (m *ui) resetHistory() tea.Cmd {
-	m.viewPending, m.viewErr = 0, nil
+	m.clearHistory()
+	return m.loadHistory()
+}
+
+func (m *ui) clearHistory() {
+	m.viewPending, m.viewErr, m.historyAgain = 0, nil, false
 	m.messages, m.rows, m.historySearch = nil, nil, nil
 	if m.focus == uiHistory {
 		m.search = nil
 	}
 	clear(m.previews)
-	m.historyLimit, m.moreHistory = historyPageSize, false
+	m.historyLimit, m.moreHistory = 0, false
 	m.rowIndex, m.rowTop, m.historyErr = 0, 0, nil
 	if m.focus == uiCompose || m.focus == uiReact || m.focus == uiEdit {
 		m.focus = uiHistory
 	}
 	m.editor = nil
-	if len(m.chats) == 0 {
+	if len(m.chats) == 0 && m.focus != uiHidden {
 		m.focus = uiChats
 	}
-	return m.loadHistory()
 }
 
 func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -339,9 +355,13 @@ func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 	}
+	wasHidden := m.focus == uiHidden
 	cmd := m.update(msg)
 	view := m.maybeViewChat()
 	m.keepSelectionVisible()
+	if wasHidden || m.focus == uiHidden {
+		return m, tea.Batch(cmd, view)
+	}
 	return m, tea.Batch(cmd, view, m.loadPreviews())
 }
 
@@ -403,12 +423,17 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		m.chatsBusy, m.chatsErr = false, msg.err
 		var history, again tea.Cmd
 		if msg.err == nil {
-			m.latestChats = msg.chats
-			history = m.orderChats()
+			m.latestChats, m.unreadChats = msg.chats, msg.unread
+			if err := m.hidden.refresh(m.latestChats); err != nil {
+				m.actionErr = fmt.Errorf("refresh hidden chats: %w", err)
+			}
+			if m.reselectChats() {
+				history = m.resetHistory()
+			}
 			if len(m.chats) > 0 && !m.chats[m.chatIndex].Unread {
 				m.viewErr = nil
 			}
-			if m.search != nil && m.focus == uiChats {
+			if m.search != nil && m.searchingChats() {
 				m.updateSearch()
 			}
 		}
@@ -542,8 +567,15 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		return m.searchKey(k)
 	}
 	key := k.String()
-	if key == "/" && (m.focus == uiChats || m.focus == uiHistory) {
+	if key == "/" && (m.searchingChats() || m.focus == uiHistory) {
 		m.startSearch()
+		return nil
+	}
+	if m.focus == uiHidden {
+		return m.hiddenKey(k)
+	}
+	if m.focus == uiChats && key == "H" && !k.Paste {
+		m.focus, m.actionErr, m.historyAgain = uiHidden, nil, false
 		return nil
 	}
 	if key == "ctrl+r" {
@@ -587,7 +619,13 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 				return nil
 			}
 			m.actionErr = nil
-			return m.orderChats()
+			if m.reselectChats() {
+				return m.resetHistory()
+			}
+		case "h":
+			if !k.Paste {
+				m.toggleHidden(m.chats[m.chatIndex])
+			}
 		default:
 			return m.moveChat(key)
 		}
@@ -709,31 +747,49 @@ func (m *ui) selectedLink() string {
 	return ""
 }
 
-func (m *ui) orderChats() tea.Cmd {
-	var selected int
-	hadChat := len(m.chats) > 0
-	if hadChat {
+// Keep the same selection when possible. The caller decides whether to load history.
+func (m *ui) reselectChats() bool {
+	selected := 0
+	if len(m.chats) > 0 {
 		selected = m.chats[m.chatIndex].ID
 	}
 	m.rebuildChats()
-	if i := slices.IndexFunc(m.chats, func(c chat) bool { return hadChat && c.ID == selected }); i >= 0 {
+	if i := chatIndex(m.chats, selected); i >= 0 {
 		m.chatIndex = i
-		return nil
+		return false
 	}
 	m.chatIndex = min(m.chatIndex, max(0, len(m.chats)-1))
-	return m.resetHistory()
+	return selected != 0 || len(m.chats) > 0
 }
 
 func (m *ui) rebuildChats() {
 	latest := m.latestChats
 	if opened := m.openedChat; opened != nil {
-		if i := slices.IndexFunc(latest, func(c chat) bool { return c.ID == opened.ID }); i >= 0 {
+		if i := chatIndex(latest, opened.ID); i >= 0 {
 			*opened = latest[i]
 		} else {
 			latest = append(slices.Clip(latest), *opened)
 		}
 	}
-	m.chats = m.pins.order(latest)
+	if len(m.restoredChats) > 0 {
+		latest = slices.Clone(latest)
+		for i, c := range m.restoredChats {
+			j := chatIndex(latest, c.ID)
+			if j >= 0 {
+				m.restoredChats[i] = latest[j]
+			} else {
+				j = len(latest)
+				latest = append(latest, c)
+			}
+			latest[j].Unread = m.unreadChats[c.ID]
+		}
+	}
+	m.chats = m.chats[:0]
+	for _, c := range m.pins.order(latest) {
+		if !m.hidden.contains(c) {
+			m.chats = append(m.chats, c)
+		}
+	}
 	m.pinnedCount = 0
 	for _, c := range m.chats {
 		if !m.pins.contains(c) {
@@ -1357,6 +1413,9 @@ func (m *ui) scrollChats(top, index, height int) int {
 func (m *ui) keepSelectionVisible() {
 	height := max(1, m.bodyHeight())
 	m.chatTop = m.scrollChats(m.chatTop, m.chatIndex, height)
+	if m.focus == uiHidden {
+		m.hiddenTop = scrollTop(m.hiddenTop, m.hiddenIndex, height, len(m.hidden.chats))
+	}
 	m.rowTop = scrollTop(m.rowTop, m.rowIndex, height, len(m.rows))
 	if len(m.rows) > 0 {
 		start := m.rowIndex - m.rows[m.rowIndex].photoRow
@@ -1384,6 +1443,9 @@ func (m *ui) View() string {
 	}
 	if m.newChat != nil {
 		return m.newChatView()
+	}
+	if m.focus == uiHidden {
+		return m.hiddenView()
 	}
 	footer := m.footer()
 	height := max(0, m.height-1-len(footer))
@@ -1420,6 +1482,9 @@ func (m *ui) View() string {
 
 func (m *ui) chatLine(row int) string {
 	if len(m.chats) == 0 && row == 0 {
+		if len(m.hidden.chats) > 0 {
+			return "No visible chats"
+		}
 		if m.chatsBusy && m.chatsErr == nil {
 			return "Loading chats…"
 		}
@@ -1447,11 +1512,7 @@ func (m *ui) chatLine(row int) string {
 	}
 	c := m.chats[index]
 	name := chatName(c)
-	dot := "  "
-	if c.Unread {
-		dot = "• "
-	}
-	mark := marker(index == selected) + dot
+	mark := chatMarker(index == selected, c.Unread)
 	if m.search != nil && m.focus == uiChats {
 		if label, ok := m.search.chatLabels[index]; ok {
 			width := m.sidebarWidth()
@@ -1466,7 +1527,7 @@ func (m *ui) chatLine(row int) string {
 
 func (m *ui) historyLine(row int) string {
 	width := m.historyWidth()
-	if len(m.rows) == 0 && len(m.chats) > 0 && row == 0 {
+	if m.historyLimit > 0 && len(m.rows) == 0 && len(m.chats) > 0 && row == 0 {
 		if m.historyBusy && m.historyErr == nil {
 			return ansi.Truncate("Loading messages…", width, "")
 		}
@@ -1527,7 +1588,13 @@ func (m *ui) footer() []string {
 	case m.search != nil:
 		lines = append(lines, m.search.prompt(m.width))
 	case m.focus == uiChats:
-		lines = append(lines, "n New Chat   Enter Open   / Search   p Pin/Unpin   ↑↓ Select   q Quit")
+		lines = append(lines, "h Hide  H Hidden  n New  Enter Open  / Search  p Pin/Unpin  ↑↓ Select  q Quit")
+	case m.focus == uiHidden:
+		keys := "H/Esc Back"
+		if len(m.hidden.chats) > 0 {
+			keys = "h Unhide   " + keys + "   / Search   ↑↓ Select"
+		}
+		lines = append(lines, keys)
 	case m.focus == uiHistory:
 		keys := "/ Search   R Reply   c Copy   r React   i Compose   Esc Chats"
 		if len(m.rows) > 0 {
@@ -1631,6 +1698,8 @@ func (m *ui) status() string {
 	switch {
 	case m.actionErr != nil:
 		return "Action: " + oneLine(m.actionErr.Error())
+	case m.focus == uiHidden:
+		return ""
 	case m.upload != nil:
 		if m.upload.size > 0 && m.upload.sent >= m.upload.size {
 			return "Finishing upload. Waiting for send confirmation…"
@@ -1668,6 +1737,13 @@ func marker(selected bool) string {
 		return "> "
 	}
 	return "  "
+}
+
+func chatMarker(selected, unread bool) string {
+	if unread {
+		return marker(selected) + "• "
+	}
+	return marker(selected) + "  "
 }
 
 func pad(s string, width int) string {
