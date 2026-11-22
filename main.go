@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -46,7 +48,10 @@ type historyLoaded struct {
 	err       error
 }
 
-type chatViewed struct{ err error }
+type chatViewed struct {
+	afterSend bool
+	err       error
+}
 
 type draftKey struct {
 	chatID int
@@ -76,8 +81,15 @@ type draftInput struct {
 }
 
 type actionFinished struct {
-	draft *messageDraft
-	err   error
+	draft  *messageDraft
+	chatID int // only set for sends
+	send   sendStart
+	err    error
+}
+
+type sendStart struct {
+	afterID int
+	at      time.Time
 }
 
 type messageEdit struct {
@@ -143,7 +155,7 @@ type previewLoaded struct {
 	err     error
 }
 
-type watchChanged struct{}
+type watchChanged struct{ chatID, messageID int }
 type watchEnded struct{ err error }
 type watchRetry struct{}
 type catchUp struct{}
@@ -160,7 +172,7 @@ type historyRow struct {
 type ui struct {
 	b       *backend
 	g       *graphics
-	events  chan struct{}
+	events  chan watchChanged
 	done    <-chan struct{}
 	accent  themeAccent
 	accents chan themeAccent
@@ -177,7 +189,8 @@ type ui struct {
 	restoredChats                   []chat // keep older unhidden chats available for this session
 	pinnedCount, chatIndex, chatTop int
 	hiddenIndex, hiddenTop          int
-	viewPending, viewing            int // chat IDs of queued and running opens
+	viewPending, viewing            int // chat IDs of a pending open and a running mark-read
+	sentReads                       []int
 	viewErr                         error
 	terminalBlurred                 bool
 	messages                        []message
@@ -197,12 +210,14 @@ type ui struct {
 	chatsBusy, chatsAgain           bool
 	historyBusy, historyAgain       bool
 	historyLimit                    int
+	watchID, followedID             int // pending watch message and latest followed row in this chat
+	sentFollow                      sendStart
 	moreHistory                     bool
 	writing, reconnecting           bool
 	videoActive                     bool
 	chatsErr, historyErr, actionErr error
 	watchErr                        error
-	notifications                   desktopNotifications
+	lastWatchID                     int // cursor used only by the watch command
 }
 
 func main() {
@@ -227,7 +242,7 @@ func runUI(b *backend) error {
 	done := make(chan struct{})
 	g := newGraphics()
 	defer g.close()
-	m := &ui{b: b, g: g, events: make(chan struct{}, 1), done: done, pins: pins, hidden: hidden, drafts: make(map[draftKey]*messageDraft)}
+	m := &ui{b: b, g: g, events: make(chan watchChanged, 1), done: done, pins: pins, hidden: hidden, drafts: make(map[draftKey]*messageDraft)}
 	defer func() {
 		close(done)
 		m.cleanupDrafts()
@@ -265,20 +280,32 @@ func (m *ui) Init() tea.Cmd {
 
 func (m *ui) watch() tea.Cmd {
 	return func() tea.Msg {
-		return watchEnded{m.b.watch(func() {
-			select {
-			case m.events <- struct{}{}:
-			default:
+		notify, _ := exec.LookPath("notify-send")
+		startedAt := time.Now().Truncate(time.Millisecond)
+		return watchEnded{m.b.watch(func(ctx context.Context, row json.RawMessage) {
+			var event watchEvent
+			var change watchChanged
+			if json.Unmarshal(row, &event) == nil && event.newMessage(startedAt, m.lastWatchID) {
+				m.lastWatchID = event.ID
+				change = watchChanged{event.ChatID, event.ID}
+				if !*event.FromMe && notify != "" && !m.hidden.containsID(event.ChatID) {
+					event.notify(ctx, notify)
+				}
 			}
-		}, m.notifications.onWatch(m.hidden.containsID))}
+			select {
+			case m.events <- change:
+			case <-ctx.Done():
+			case <-m.done:
+			}
+		})}
 	}
 }
 
 func (m *ui) waitForWatch() tea.Cmd {
 	return func() tea.Msg {
 		select {
-		case <-m.events:
-			return watchChanged{}
+		case change := <-m.events:
+			return change
 		case <-m.done:
 			return nil
 		}
@@ -338,6 +365,7 @@ func (m *ui) clearHistory() {
 	}
 	clear(m.previews)
 	m.historyLimit, m.moreHistory = 0, false
+	m.watchID, m.followedID, m.sentFollow = 0, 0, sendStart{}
 	m.rowIndex, m.rowTop, m.historyErr = 0, 0, nil
 	if m.focus == uiCompose || m.focus == uiReact || m.focus == uiEdit {
 		m.focus = uiHistory
@@ -357,12 +385,53 @@ func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	wasHidden := m.focus == uiHidden
 	cmd := m.update(msg)
+	if !m.canFollowHistory() {
+		m.watchID, m.sentFollow = 0, sendStart{}
+	}
 	view := m.maybeViewChat()
 	m.keepSelectionVisible()
 	if wasHidden || m.focus == uiHidden {
 		return m, tea.Batch(cmd, view)
 	}
 	return m, tea.Batch(cmd, view, m.loadPreviews())
+}
+
+func (m *ui) canFollowHistory() bool {
+	return (m.focus == uiHistory || m.focus == uiCompose) && m.search == nil && m.newChat == nil && !m.terminalBlurred
+}
+
+func (m *ui) followingChat(id int) bool {
+	return m.canFollowHistory() && len(m.chats) > 0 && m.chats[m.chatIndex].ID == id
+}
+
+func (m *ui) followNewMessages(messages []message) bool {
+	if !m.canFollowHistory() || (m.watchID == 0 && m.sentFollow.at.IsZero()) {
+		return false
+	}
+	previous := m.followedID
+	for _, item := range slices.Backward(messages) {
+		watched := m.watchID != 0 && item.ID == m.watchID
+		sent := !m.sentFollow.at.IsZero() && item.FromMe && item.ID > m.sentFollow.afterID &&
+			!item.CreatedAt.Before(m.sentFollow.at) && item.UnsentAt == nil
+		if watched {
+			m.watchID = 0
+		}
+		if sent {
+			m.sentFollow = sendStart{}
+		}
+		if (watched || sent) && item.UnsentAt == nil {
+			m.followedID = max(m.followedID, item.ID)
+		}
+	}
+	// Watch and send completion can both report the same row.
+	return m.followedID > previous
+}
+
+func (m *ui) followLoadedMessages() {
+	// A refresh can load the row before watch or send completion reports it.
+	if m.followNewMessages(m.messages) {
+		m.rowIndex = len(m.rows) - 1
+	}
 }
 
 func (m *ui) atLatestMessage() bool {
@@ -377,6 +446,15 @@ func (m *ui) requestViewChat() {
 }
 
 func (m *ui) maybeViewChat() tea.Cmd {
+	if m.viewing == 0 && len(m.sentReads) > 0 {
+		id := m.sentReads[0]
+		m.sentReads = m.sentReads[1:]
+		if m.viewPending == id {
+			m.viewPending = 0
+		}
+		// Only the Mac can tell whether the destination is still unread.
+		return m.markRead(id, true)
+	}
 	id := m.viewPending
 	if id == 0 {
 		return nil
@@ -399,8 +477,12 @@ func (m *ui) maybeViewChat() tea.Cmd {
 		m.viewErr = errors.New("latest message is not available")
 		return nil
 	}
+	return m.markRead(id, false)
+}
+
+func (m *ui) markRead(id int, afterSend bool) tea.Cmd {
 	m.viewing = id
-	return func() tea.Msg { return chatViewed{m.b.viewChat(id)} }
+	return func() tea.Msg { return chatViewed{afterSend, m.b.viewChat(id)} }
 }
 
 func (m *ui) update(msg tea.Msg) tea.Cmd {
@@ -415,7 +497,7 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		return m.waitForAccent
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.setHistory(m.messages)
+		m.setHistory(m.messages, m.rowIndex == len(m.rows)-1)
 		if m.search != nil && m.focus == uiHistory {
 			m.updateSearch()
 		}
@@ -455,7 +537,7 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 						messages = slices.Concat(m.messages[:overlap], messages)
 					}
 				}
-				m.setHistory(messages)
+				m.setHistory(messages, m.followNewMessages(messages))
 				if m.search != nil && m.focus == uiHistory {
 					m.updateSearch()
 				}
@@ -473,7 +555,9 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 			}
 			return m.loadChats()
 		}
-		if len(m.chats) > 0 && m.chats[m.chatIndex].ID == id && m.chats[m.chatIndex].Unread {
+		if msg.afterSend {
+			m.actionErr = fmt.Errorf("message sent to chat %d, but could not mark it read: %w", id, msg.err)
+		} else if len(m.chats) > 0 && m.chats[m.chatIndex].ID == id && m.chats[m.chatIndex].Unread {
 			m.viewErr = msg.err
 		}
 	case previewLoaded:
@@ -515,6 +599,10 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		}
 	case watchChanged:
 		m.reconnecting, m.watchErr = false, nil
+		if msg.messageID > m.followedID && m.followingChat(msg.chatID) {
+			m.watchID = msg.messageID
+			m.followLoadedMessages()
+		}
 		return tea.Batch(m.waitForWatch(), m.refresh())
 	case watchEnded:
 		m.reconnecting, m.watchErr = true, msg.err
@@ -551,6 +639,11 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 				draft.file.cleanup()
 			}
 			*draft = messageDraft{}
+			m.sentReads = append(m.sentReads, msg.chatID)
+			if m.followingChat(msg.chatID) {
+				m.sentFollow = msg.send
+				m.followLoadedMessages()
+			}
 		}
 		return m.refresh()
 	case tea.KeyMsg:
@@ -768,6 +861,7 @@ func (m *ui) rebuildChats() {
 		if i := chatIndex(latest, opened.ID); i >= 0 {
 			*opened = latest[i]
 		} else {
+			opened.Unread = m.unreadChats[opened.ID]
 			latest = append(slices.Clip(latest), *opened)
 		}
 	}
@@ -1042,20 +1136,25 @@ func (m *ui) sendDraft(key draftKey, draft *messageDraft) tea.Cmd {
 	m.focus = uiHistory
 	m.writing, m.sending, m.actionErr = true, draft, nil
 	draft.inputErr = nil
+	// Take the baseline before any refresh can see the sent message.
+	send := sendStart{at: time.Now().Truncate(time.Millisecond)}
+	for _, item := range m.messages {
+		send.afterID = max(send.afterID, item.ID)
+	}
 	if draft.file != nil {
 		file := *draft.file
 		upload := &fileUpload{size: file.Size, updates: make(chan int64, 1)}
 		m.upload = upload
 		return tea.Batch(func() tea.Msg {
 			defer close(upload.updates)
-			return actionFinished{draft, m.b.sendFile(key.chatID, text, file, upload.report)}
+			return actionFinished{draft, key.chatID, send, m.b.sendFile(key.chatID, text, file, upload.report)}
 		}, func() tea.Msg { return upload.wait(m.done) })
 	}
 	return func() tea.Msg {
 		if key.guid != "" {
-			return actionFinished{draft, m.b.reply(key.chatID, key.guid, text)}
+			return actionFinished{draft, key.chatID, send, m.b.reply(key.chatID, key.guid, text)}
 		}
-		return actionFinished{draft, m.b.send(key.chatID, text)}
+		return actionFinished{draft, key.chatID, send, m.b.send(key.chatID, text)}
 	}
 }
 
@@ -1172,8 +1271,8 @@ func threadLabel(thread threadOrigin, root *message) string {
 	return replyLabel(thread.Author, text)
 }
 
-func (m *ui) setHistory(messages []message) {
-	follow := m.rowIndex >= len(m.rows)-1
+func (m *ui) setHistory(messages []message, follow bool) {
+	follow = follow || len(m.rows) == 0
 	var old historyRow
 	var selectedID, offset int
 	if !follow {

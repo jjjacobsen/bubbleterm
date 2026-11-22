@@ -262,6 +262,7 @@ func (m *ui) finishNewChat(msg newChatStarted) tea.Cmd {
 		s.err = msg.err
 		return nil
 	}
+	m.sentReads = append(m.sentReads, msg.chat.ID)
 	return tea.Batch(m.openDirectoryChat(msg.chat), m.loadChats())
 }
 

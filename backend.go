@@ -280,7 +280,7 @@ func (b backend) react(id int, m message, kind string) error {
 }
 
 // watch blocks until the stream stops or close cancels it.
-func (b backend) watch(refresh func(), onEvent func(context.Context, json.RawMessage)) error {
+func (b backend) watch(onEvent func(context.Context, json.RawMessage)) error {
 	s, err := b.open()
 	if err != nil {
 		return err
@@ -319,9 +319,6 @@ func (b backend) watch(refresh func(), onEvent func(context.Context, json.RawMes
 			}
 			return io.EOF
 		}
-		refresh()
-		if onEvent != nil {
-			onEvent(s.ctx, row)
-		}
+		onEvent(s.ctx, row)
 	}
 }

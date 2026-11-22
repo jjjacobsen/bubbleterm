@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"html"
 	"os/exec"
 	"slices"
@@ -13,12 +12,8 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-type desktopNotifications struct {
-	lastID int64
-}
-
 type watchEvent struct {
-	ID          int64        `json:"id"`
+	ID          int          `json:"id"`
 	ChatID      int          `json:"chat_id"`
 	CreatedAt   time.Time    `json:"created_at"`
 	FromMe      *bool        `json:"is_from_me"`
@@ -33,29 +28,15 @@ type watchEvent struct {
 	Attachments []attachment `json:"attachments"`
 }
 
-func (n *desktopNotifications) onWatch(isHidden func(int) bool) func(context.Context, json.RawMessage) {
-	command, err := exec.LookPath("notify-send")
-	if err != nil {
-		return nil
-	}
-	// imsg starts at the current tail. Also skip old texts newly synced into it.
-	startedAt := time.Now().Truncate(time.Millisecond)
-	return func(ctx context.Context, row json.RawMessage) {
-		var event watchEvent
-		if err := json.Unmarshal(row, &event); err != nil ||
-			event.FromMe == nil || *event.FromMe || event.Type != "" || event.IsReaction || event.UnsentAt != "" ||
-			event.ID <= n.lastID || event.CreatedAt.Before(startedAt) {
-			return
-		}
-		summary, body := event.notification()
-		if body == "" {
-			return
-		}
-		// New rows arrive in ID order. Keep this cursor across watch reconnects.
-		n.lastID = event.ID
-		if event.ChatID == 0 || isHidden(event.ChatID) {
-			return
-		}
+func (event watchEvent) newMessage(startedAt time.Time, lastID int) bool {
+	// Skip old texts newly synced into the watch stream.
+	return event.ChatID != 0 && event.ID > lastID && !event.CreatedAt.Before(startedAt) &&
+		event.FromMe != nil && event.Type == "" && !event.IsReaction && event.UnsentAt == ""
+}
+
+func (event watchEvent) notify(ctx context.Context, command string) {
+	summary, body := event.notification()
+	if body != "" {
 		go sendNotification(ctx, command, summary, body)
 	}
 }
