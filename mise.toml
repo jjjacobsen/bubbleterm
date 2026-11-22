@@ -4,5 +4,13 @@ go = "1.26"
 [tasks.build]
 run = "go build ./..."
 
+[tasks.install]
+description = "Install the BubbleTerm binary and Omarchy launcher"
+run = '''
+mkdir -p "$HOME/.local/bin"
+go build -o "$HOME/.local/bin/bubbleterm" .
+omarchy-tui-install BubbleTerm "\"$HOME/.local/bin/bubbleterm\"" tile internet-group-chat
+'''
+
 [tasks.chat]
 run = "go run ."

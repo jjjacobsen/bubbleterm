@@ -260,7 +260,7 @@ func (m *ui) cleanupDrafts() {
 }
 
 func (m *ui) Init() tea.Cmd {
-	return tea.Batch(m.loadChats(), m.watch(), m.waitForWatch(), m.waitForAccent, catchUpLater())
+	return tea.Batch(tea.SetWindowTitle("BubbleTerm"), m.loadChats(), m.watch(), m.waitForWatch(), m.waitForAccent, catchUpLater())
 }
 
 func (m *ui) watch() tea.Cmd {
