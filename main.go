@@ -170,6 +170,7 @@ type ui struct {
 	focus                           int
 	pins                            *pins
 	latestChats, chats              []chat
+	openedChat                      *chat // keep a chat opened outside the recent list
 	pinnedCount, chatIndex, chatTop int
 	viewPending, viewing            int // chat IDs of queued and running opens
 	viewErr                         error
@@ -179,6 +180,7 @@ type ui struct {
 	historySearch                   []historySearchBlock
 	rowIndex, rowTop                int
 	search                          *paneSearch
+	newChat                         *newChatModal
 	drafts                          map[draftKey]*messageDraft
 	composeDraft                    draftKey
 	replyContext                    string
@@ -333,7 +335,7 @@ func (m *ui) resetHistory() tea.Cmd {
 func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
 		key := k.String()
-		if key == "ctrl+c" || (key == "q" && m.focus != uiCompose && m.focus != uiEdit && m.search == nil) {
+		if key == "ctrl+c" || (key == "q" && m.focus != uiCompose && m.focus != uiEdit && m.search == nil && m.newChat == nil) {
 			return m, tea.Quit
 		}
 	}
@@ -441,6 +443,9 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		id := m.viewing
 		m.viewing = 0
 		if msg.err == nil {
+			if m.openedChat != nil && m.openedChat.ID == id {
+				m.openedChat.Unread = false
+			}
 			return m.loadChats()
 		}
 		if len(m.chats) > 0 && m.chats[m.chatIndex].ID == id && m.chats[m.chatIndex].Unread {
@@ -469,7 +474,14 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		if msg.err != nil {
 			m.actionErr = msg.err
 		}
+	case directoryLoaded:
+		m.finishDirectory(msg)
+	case newChatStarted:
+		return m.finishNewChat(msg)
 	case shiftEnterMsg:
+		if m.newChat != nil {
+			return m.newChatKey(tea.KeyMsg{Type: tea.KeyCtrlJ})
+		}
 		if m.focus == uiCompose || m.focus == uiEdit {
 			return m.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'\n'}})
 		}
@@ -523,6 +535,9 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 }
 
 func (m *ui) key(k tea.KeyMsg) tea.Cmd {
+	if m.newChat != nil {
+		return m.newChatKey(k)
+	}
 	if m.search != nil {
 		return m.searchKey(k)
 	}
@@ -533,6 +548,9 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 	}
 	if key == "ctrl+r" {
 		return m.refresh()
+	}
+	if m.focus == uiChats && (key == "n" || key == "N") {
+		return m.openNewChat()
 	}
 	if len(m.chats) == 0 {
 		return nil
@@ -697,7 +715,25 @@ func (m *ui) orderChats() tea.Cmd {
 	if hadChat {
 		selected = m.chats[m.chatIndex].ID
 	}
-	m.chats = m.pins.order(m.latestChats)
+	m.rebuildChats()
+	if i := slices.IndexFunc(m.chats, func(c chat) bool { return hadChat && c.ID == selected }); i >= 0 {
+		m.chatIndex = i
+		return nil
+	}
+	m.chatIndex = min(m.chatIndex, max(0, len(m.chats)-1))
+	return m.resetHistory()
+}
+
+func (m *ui) rebuildChats() {
+	latest := m.latestChats
+	if opened := m.openedChat; opened != nil {
+		if i := slices.IndexFunc(latest, func(c chat) bool { return c.ID == opened.ID }); i >= 0 {
+			*opened = latest[i]
+		} else {
+			latest = append(slices.Clip(latest), *opened)
+		}
+	}
+	m.chats = m.pins.order(latest)
 	m.pinnedCount = 0
 	for _, c := range m.chats {
 		if !m.pins.contains(c) {
@@ -705,12 +741,6 @@ func (m *ui) orderChats() tea.Cmd {
 		}
 		m.pinnedCount++
 	}
-	if i := slices.IndexFunc(m.chats, func(c chat) bool { return hadChat && c.ID == selected }); i >= 0 {
-		m.chatIndex = i
-		return nil
-	}
-	m.chatIndex = min(m.chatIndex, max(0, len(m.chats)-1))
-	return m.resetHistory()
 }
 
 func (m *ui) moveChat(key string) tea.Cmd {
@@ -1252,8 +1282,8 @@ func (m *ui) thumbnailSpace() bool {
 }
 
 func (m *ui) loadPreviews() tea.Cmd {
-	// Leave the existing thumbnail cache in place while previewing search hits.
-	if m.search != nil {
+	// Keep the cache while a modal or search changes what is visible.
+	if m.newChat != nil || m.search != nil {
 		return nil
 	}
 	if !m.thumbnailSpace() || (m.sidebarWidth() == 0 && m.focus == uiChats) {
@@ -1351,6 +1381,9 @@ func scrollTop(top, index, height, size int) int {
 func (m *ui) View() string {
 	if m.width < 1 || m.height < 1 {
 		return ""
+	}
+	if m.newChat != nil {
+		return m.newChatView()
 	}
 	footer := m.footer()
 	height := max(0, m.height-1-len(footer))
@@ -1494,7 +1527,7 @@ func (m *ui) footer() []string {
 	case m.search != nil:
 		lines = append(lines, m.search.prompt(m.width))
 	case m.focus == uiChats:
-		lines = append(lines, "Enter Open   / Search   p Pin/Unpin   ↑↓ Select   q Quit")
+		lines = append(lines, "n New Chat   Enter Open   / Search   p Pin/Unpin   ↑↓ Select   q Quit")
 	case m.focus == uiHistory:
 		keys := "/ Search   R Reply   c Copy   r React   i Compose   Esc Chats"
 		if len(m.rows) > 0 {

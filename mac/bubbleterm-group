@@ -1,0 +1,201 @@
+#!/bin/sh
+set -eu
+
+# Use the sibling helper's AX, SQLite and attributed-body functions.
+shared=$(/usr/bin/awk '
+    NR <= 2 { next }
+    /^function run\(args\) \{/ { found = 1; exit }
+    { print }
+    END { if (!found) exit 1 }
+' "$(/usr/bin/dirname "$0")/bubbleterm-react")
+{
+    printf '%s\n' "$shared"
+    /bin/cat <<'JXA'
+ObjC.import('Quartz');
+ObjC.bindFunction('CGPreflightPostEventAccess', ['bool', []]);
+ObjC.bindFunction('AXUIElementIsAttributeSettable', ['int', ['id', 'id', 'bool*']]);
+ObjC.bindFunction('AXUIElementSetAttributeValue', ['int', ['id', 'id', 'id']]);
+
+const equals = (a, b) => a && b && $.CFEqual(a, b);
+const hiddenTree = el => [transcriptID, 'ConversationList'].includes(identifier(el));
+const rawAddress = s => typeof s === 'string' && !/[^\x21-\x7e]/.test(s) &&
+    (/^\+[1-9][0-9]{6,14}$/.test(s) || /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+$/i.test(s));
+const sameAddresses = (actual, expected) => actual.length === expected.length &&
+    new Set(actual).size === actual.length && expected.every(address => actual.includes(address));
+const labeled = (el, names) => ['AXTitle', 'AXDescription'].some(name => names.includes(value(el, name)));
+const toLabels = ['To', 'To:'];
+
+function axSet(el, name, input) {
+    const settable = Ref();
+    if ($.AXUIElementIsAttributeSettable(el, name, settable) !== 0 || !settable[0] ||
+        $.AXUIElementSetAttributeValue(el, name, $(input)) !== 0) {
+        throw new Error('Cannot set ' + name + ' on the verified Messages field');
+    }
+}
+
+function groupWindow(running, app) {
+    if (!running.isActive) return null;
+    const windows = value(app, 'AXWindows');
+    const window = attr(app, 'AXFocusedWindow');
+    return windows && windows.length === 1 && equals(windows[0], window) &&
+        value(window, 'AXSubrole') === 'AXStandardWindow' && identifier(window) === 'SceneWindow' ? window : null;
+}
+
+function groupDraft(window) {
+    if (!window) return null;
+    const scan = match => find(window, match, hiddenTree);
+    // Never switch conversations or send from a reply, a selected conversation or a modal view.
+    if (scan(el => identifier(el) === 'ConversationTitle' || ['AXSheet', 'AXDialog', 'AXMenu'].includes(role(el))).length) return null;
+    const transcripts = scan(el => identifier(el) === transcriptID);
+    if (transcripts.length > 1 || transcripts.some(el => children(el).length || value(el, 'AXDescription') !== 'Messages')) return null;
+    const entries = scan(el => identifier(el) === 'MessageEntryView');
+    if (entries.length !== 1) return null;
+    const entry = entries[0];
+    const parts = children(entry);
+    const body = parts.filter(el => role(el) === 'AXTextField' && identifier(el) === 'messageBodyField');
+    const send = parts.filter(el => role(el) === 'AXButton' && identifier(el) === 'sendButton' && labeled(el, ['Send']));
+    // No subject, audio recording, file, reply preview, effect or other accessory.
+    const other = parts.filter(el => !body.includes(el) && !send.includes(el));
+    if (body.length !== 1 || send.length > 1 || other.length !== 3 ||
+        other.some((el, i) => role(el) !== 'AXButton' || value(el, 'AXDescription') !== ['add', 'Record audio', 'Emoji picker'][i])) return null;
+
+    const isToLabel = el => role(el) === 'AXStaticText' && toLabels.includes(value(el, 'AXValue'));
+    const fields = scan(el => role(el) === 'AXTextField' && !equals(el, body[0]) &&
+        (labeled(el, toLabels) || children(attr(el, 'AXParent')).some(isToLabel)));
+    if (fields.length !== 1) return null;
+    const to = fields[0];
+    const header = attr(to, 'AXParent');
+    const siblings = children(header).filter(el => !equals(el, to) && !isToLabel(el) &&
+        !(role(el) === 'AXButton' && labeled(el, ['Add Contact', 'Add Recipient'])));
+    const tokens = [...siblings, ...children(to)];
+    const addresses = tokens.map(el => {
+        if (!['AXButton', 'AXMenuButton', 'AXPopUpButton'].includes(role(el)) || children(el).length) return null;
+        // Do not parse formatted labels, option lists, or display names as addresses.
+        const raw = ['AXValue', 'AXTitle', 'AXDescription'].map(key => value(el, key)).filter(rawAddress);
+        return raw.length && raw.every(address => address === raw[0]) ? raw[0] : null;
+    });
+    if (addresses.some(address => address === null)) return null;
+    return { entry, header, to, addresses, body: body[0], send: send[0] };
+}
+
+function fieldText(el, expected) {
+    const text = value(el, 'AXValue');
+    return (text === expected || (text === null && expected === '')) &&
+        value(el, 'AXNumberOfCharacters') === expected.length;
+}
+
+function groupRow(after, text, addresses) {
+    const needle = sqlQuote(text);
+    const rows = query(`SELECT CAST(m.ROWID AS TEXT) AS id, m.guid, m.service, m.text, hex(m.attributedBody) AS body,
+        m.is_sent AS sent, m.is_finished AS finished, COALESCE(m.error, 0) AS error,
+        (SELECT count(*) FROM chat_message_join j WHERE j.message_id = m.ROWID) AS joins,
+        (m.part_count = 1 AND COALESCE(m.item_type, 0) = 0 AND COALESCE(m.is_system_message, 0) = 0
+         AND COALESCE(m.date_retracted, 0) = 0 AND COALESCE(m.schedule_type, 0) = 0 AND COALESCE(m.subject, '') = ''
+         AND m.thread_originator_guid IS NULL AND m.balloon_bundle_id IS NULL
+         AND NOT EXISTS (SELECT 1 FROM message_attachment_join a WHERE a.message_id = m.ROWID)) AS plain
+      FROM message m
+      WHERE m.ROWID > ${after} AND m.is_from_me = 1 AND COALESCE(m.associated_message_type, 0) = 0
+        AND (m.text COLLATE BINARY = ${needle} OR (m.text IS NULL AND instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0))`)
+        .filter(row => messageText(row) === text);
+    if (rows.length > 1) throw new Error('More than one new outgoing message has the exact text');
+    const [row] = rows;
+    if (!row) return null;
+    if (row.error || !row.guid || row.service !== 'iMessage' || !row.plain || row.joins > 1) {
+        throw new Error('The new outgoing row is not a unique plain iMessage');
+    }
+    if (!row.sent || !row.finished || row.joins !== 1) return null;
+    const chats = query(`SELECT c.service_name AS service,
+        (c.style = 43 OR instr(c.guid, ';+;') > 0 OR instr(c.chat_identifier, ';+;') > 0) AS isGroup,
+        json_group_array(h.id) FILTER (WHERE k.chat_id IS NOT NULL) AS members
+      FROM chat_message_join j JOIN chat c ON c.ROWID = j.chat_id
+      LEFT JOIN chat_handle_join k ON k.chat_id = c.ROWID LEFT JOIN handle h ON h.ROWID = k.handle_id
+      WHERE j.message_id = ${row.id} GROUP BY c.ROWID`);
+    if (chats.length !== 1 || chats[0].service !== 'iMessage' || !chats[0].isGroup ||
+        !sameAddresses(JSON.parse(chats[0].members).map(address => rawAddress(address) ? address.toLowerCase() : null), addresses)) {
+        throw new Error('The new iMessage does not have the exact group members');
+    }
+    return row.guid;
+}
+
+function run(args) {
+    let attempted = false, touched = false;
+    try {
+        const [text, ...addresses] = args;
+        if (addresses.length < 2 || !addresses.every(rawAddress) || new Set(addresses).size !== addresses.length ||
+            !text.trim() || /[\x00\ufffc\ufffd]/.test(text)) throw new Error('Invalid text or group recipient addresses');
+        if (!$.AXIsProcessTrusted() || !$.CGPreflightPostEventAccess()) throw new Error('Grant Accessibility access to the Messages helper');
+        const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(bundle);
+        if (Number(apps.count) !== 1) throw new Error('Open a blank New Message draft in Messages and leave it in front');
+        const running = apps.firstObject;
+        const app = $.AXUIElementCreateApplication(running.processIdentifier);
+        if ($.AXUIElementSetMessagingTimeout(app, 1) !== 0) throw new Error('Cannot set the Messages AX timeout');
+        const window = groupWindow(running, app);
+        const initial = groupDraft(window);
+        if (!initial || initial.addresses.length || !fieldText(initial.to, '') || !fieldText(initial.body, '')) {
+            throw new Error('Cannot verify a blank New Message draft. Open one in Messages and leave it in front');
+        }
+        const probe = (want, input, body) => {
+            const focused = groupWindow(running, app);
+            if (!equals(window, focused)) return null;
+            const draft = groupDraft(focused);
+            return draft && equals(draft.entry, initial.entry) && equals(draft.header, initial.header) &&
+                equals(draft.body, initial.body) && sameAddresses(draft.addresses, want) &&
+                fieldText(draft.to, input) && fieldText(draft.body, body) ? draft : null;
+        };
+        const focusIs = el => equals(attr(app, 'AXFocusedUIElement'), el);
+        const need = (draft, reason) => {
+            if (!draft) throw new Error(reason);
+            return draft;
+        };
+        // Take a read-only boundary before modifying the draft. Take it again before submission.
+        const watermark = () => query('SELECT CAST(COALESCE(max(ROWID), 0) AS TEXT) AS id FROM message')[0].id;
+        watermark();
+        const enter = keyEvents(36);
+        const added = [];
+        for (const address of addresses) {
+            const draft = need(probe(added, '', ''), 'The recipient list changed');
+            touched = true;
+            if (!focusIs(draft.to)) axSet(draft.to, 'AXFocused', true);
+            const empty = need(probe(added, '', ''), 'The draft changed before recipient entry');
+            if (!focusIs(empty.to) || !value(empty.to, 'AXEnabled')) throw new Error('The To field is not in focus');
+            axSet(empty.to, 'AXValue', address);
+            const typed = need(probe(added, address, ''), 'Cannot verify the raw address in the To field');
+            if (!equals(typed.to, empty.to) || !focusIs(typed.to) || !equals(groupWindow(running, app), window)) {
+                throw new Error('The To field changed before the address could be confirmed');
+            }
+            // With focus proven in To and a completely empty body, Return only confirms the address.
+            postKey(running.processIdentifier, enter);
+            added.push(address);
+            need(waitFor(() => probe(added, '', ''), 2), 'Cannot verify the exact raw recipient chips');
+        }
+        const ready = need(probe(addresses, '', ''), 'The recipient set changed before message entry');
+        if (!value(ready.body, 'AXEnabled') || value(ready.body, 'AXPlaceholderValue') !== 'iMessage') {
+            throw new Error('The group composer does not confirm iMessage service');
+        }
+        if (!focusIs(ready.body)) axSet(ready.body, 'AXFocused', true);
+        const empty = need(probe(addresses, '', ''), 'The draft changed before message entry');
+        if (!focusIs(empty.body)) throw new Error('The message field is not in focus');
+        axSet(empty.body, 'AXValue', text);
+        const after = watermark();
+        const verified = need(probe(addresses, '', text), 'Cannot verify the exact message text and recipient set');
+        if (verified.send && (!value(verified.send, 'AXEnabled') || !hasAction(verified.send, 'AXPress'))) {
+            throw new Error('Messages did not enable the verified Send button');
+        }
+        if (!value(verified.body, 'AXEnabled') || value(verified.body, 'AXPlaceholderValue') !== 'iMessage' ||
+            !focusIs(verified.body) || !equals(groupWindow(running, app), window)) {
+            throw new Error('Messages focus or transport changed before submission');
+        }
+        // Never retry submission, even if the AX call or the SSH session times out.
+        attempted = true;
+        if (verified.send) $.AXUIElementPerformAction(verified.send, 'AXPress');
+        else postKey(running.processIdentifier, enter);
+        const guid = waitFor(() => groupRow(after, text, addresses), 10);
+        if (!guid) throw new Error('No matching sent iMessage was recorded');
+        return JSON.stringify({ status: 'sent', guid });
+    } catch (error) {
+        return JSON.stringify({ status: attempted ? 'unknown' : 'not_sent',
+            error: error.message + (touched && !attempted ? '. Check Messages for an unsent draft' : '') });
+    }
+}
+JXA
+} | /usr/bin/osascript -l JavaScript - "$@"
