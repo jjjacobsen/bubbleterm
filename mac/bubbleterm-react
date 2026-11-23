@@ -89,6 +89,7 @@ function resolveTarget(chat, guid, filename) {
         SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, c.service_name AS chatService,
                m.is_from_me AS outgoing, m.service, m.thread_originator_guid AS origin,
                m.date / 1000000000 + 978307200 AS seconds, m.part_count AS parts,
+               instr(m.attributedBody, CAST('__kIMCalendarEventAttributeName' AS BLOB)) > 0 AS calendarEvent,
                m.text, hex(m.attributedBody) AS body
         FROM chat c
         JOIN chat_message_join j ON j.chat_id = c.ROWID
@@ -148,7 +149,9 @@ function resolveTarget(chat, guid, filename) {
     if (duplicates.some(row => row.outgoing === target.outgoing)) {
         throw new Error('Target text is not unique for that sender direction in this chat');
     }
-    return { ...target, text, part, ambiguousDirection: duplicates.length > 0 };
+    const calendarMinute = !files.length && target.parts === 1 && target.service === 'iMessage' &&
+        target.seconds && target.calendarEvent ? clock(target.seconds) : null;
+    return { ...target, text, part, calendarMinute, ambiguousDirection: duplicates.length > 0 };
 }
 
 function attr(element, name) {
@@ -246,8 +249,10 @@ function horizontalBounds(element) {
     return [Number(match[1]), Number(match[1]) + Number(match[2])];
 }
 
-function targetBalloons(view, target) {
-    const visible = value(view, 'AXVisibleChildren') || children(view);
+const visibleRows = view => value(view, 'AXVisibleChildren') || children(view);
+
+function targetOwners(view, target) {
+    const visible = visibleRows(view);
     if (target.kind) {
         return visible.flatMap(row => {
             const description = value(row, 'AXDescription');
@@ -262,16 +267,30 @@ function targetBalloons(view, target) {
             return buttons;
         });
     }
-    return visible.flatMap(child => find(child, el => identifier(el) === 'CKBalloonTextView' &&
-        value(el, 'AXValue') === target.text)).filter(balloon => {
-        if (!target.ambiguousDirection) return true;
-        // Self chats can display a sent and a received copy of the same text.
-        const [left, right] = horizontalBounds(view);
-        const [start, end] = horizontalBounds(balloon);
-        const middle = (left + right) / 2;
-        if (start > middle) return target.outgoing === 1;
-        if (end < middle) return target.outgoing === 0;
-        throw new Error('Cannot distinguish the sender direction of a matching balloon');
+    return visible.flatMap(row => {
+        const owners = find(row, el => identifier(el) === 'CKBalloonTextView' && value(el, 'AXValue') === target.text)
+            .filter(balloon => {
+                if (!target.ambiguousDirection) return true;
+                // Self chats can display a sent and a received copy of the same text.
+                const [left, right] = horizontalBounds(view);
+                const [start, end] = horizontalBounds(balloon);
+                const middle = (left + right) / 2;
+                if (start > middle) return target.outgoing === 1;
+                if (end < middle) return target.outgoing === 0;
+                throw new Error('Cannot distinguish the sender direction of a matching balloon');
+            }).map(balloon => attr(balloon, 'AXParent'));
+        if (!target.calendarMinute) return owners;
+
+        // Calendar links can replace the text area with a group that exposes text only in its description.
+        const description = value(row, 'AXDescription');
+        const separator = description?.indexOf(', ') ?? -1;
+        if (separator < 1) return owners;
+        const sender = description.slice(0, separator);
+        const body = description.slice(separator + 2);
+        if ((target.outgoing ? sender !== 'Your iMessage' : sender.startsWith('Your ')) ||
+            body.startsWith('Reply Preview, ') || body !== target.text + ', ' + target.calendarMinute) return owners;
+        return owners.concat(children(row).filter(el => role(el) === 'AXGroup' && identifier(el) === 'Sticker' &&
+            !children(el).length && value(el, 'AXDescription') === description));
     });
 }
 
@@ -321,35 +340,50 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
         current = transcript();
         if (!current || !$.CFEqual(current.window, context.window)) throw new Error('Messages switched chats or windows');
     }
-    for (let page = 0; page <= 3; page++) {
-        const matches = targetBalloons(current.view, target);
+    const locate = () => {
+        const matches = targetOwners(current.view, target);
         if (matches.length > 1) throw new Error('More than one balloon matches the target');
-        if (matches.length === 1) {
-            const balloon = matches[0];
-            const owner = target.kind ? balloon : attr(balloon, 'AXParent');
-            const window = focusedWindow();
-            if (!window || !$.CFEqual(window, current.window) || !owner || !hasAction(owner, 'AXShowMenu')) {
-                throw new Error('Cannot open the exact target balloon menu');
-            }
-            if (mode === '--dry-run') return 'Tapback target found. No menu opened or reaction sent.';
-            return withMenuItem(app, window, owner, () => {
-                const focused = focusedWindow();
-                if (!focused || !$.CFEqual(focused, window)) throw new Error('Messages switched chats or windows');
-                const found = targetBalloons(current.view, target);
-                if (found.length !== 1 || !$.CFEqual(found[0], balloon)) throw new Error('The target balloon changed');
-            }, itemID, item => useItem(item, context));
+        return matches[0];
+    };
+    let owner = locate();
+    if (!owner && mode === '--dry-run') throw new Error('Target balloon is not visible in the selected chat');
+
+    const search = (action, limit) => {
+        let pages = 0;
+        for (; !owner && pages < limit; pages++) {
+            let el = current.view;
+            while (el && !$.CFEqual(el, current.window) && !hasAction(el, action)) el = attr(el, 'AXParent');
+            if (!el || $.CFEqual(el, current.window)) break;
+            const first = visibleRows(current.view)[0];
+            const frame = first && attr(first, 'AXFrame');
+            if ($.AXUIElementPerformAction(el, action) !== 0) break;
+            delay(0.35);
+            current = transcript();
+            if (!current || !$.CFEqual(current.window, context.window)) throw new Error('Messages switched chats or windows');
+            owner = locate();
+            if (owner) break;
+            const next = visibleRows(current.view)[0];
+            const nextFrame = next && attr(next, 'AXFrame');
+            if (frame && nextFrame && $.CFEqual(first, next) && $.CFEqual(frame, nextFrame)) break;
         }
-        if (mode === '--dry-run') throw new Error('Target balloon is not visible in the selected chat');
-        if (page === 3) break;
-        const scroll = 'AXScrollUpByPage';
-        let el = current.view;
-        while (el && !$.CFEqual(el, current.window) && !hasAction(el, scroll)) el = attr(el, 'AXParent');
-        if (!el || $.CFEqual(el, current.window) || $.AXUIElementPerformAction(el, scroll) !== 0) break;
-        delay(0.35);
-        current = transcript();
-        if (!current) break;
+        return pages;
+    };
+    // Opening a chat can leave it scrolled back. Check newer pages, then retrace them to search older pages.
+    const newerPages = search('AXScrollDownByPage', 10);
+    search('AXScrollUpByPage', newerPages + 3);
+    if (!owner) throw new Error('Target balloon not found. Scroll to it in Messages and retry');
+
+    const window = focusedWindow();
+    if (!window || !$.CFEqual(window, current.window) || !owner || !hasAction(owner, 'AXShowMenu')) {
+        throw new Error('Cannot open the exact target balloon menu');
     }
-    throw new Error('Target balloon not found within three scroll pages');
+    if (mode === '--dry-run') return 'Tapback target found. No menu opened or reaction sent.';
+    return withMenuItem(app, window, owner, () => {
+        const focused = focusedWindow();
+        if (!focused || !$.CFEqual(focused, window)) throw new Error('Messages switched chats or windows');
+        const found = targetOwners(current.view, target);
+        if (found.length !== 1 || !$.CFEqual(found[0], owner)) throw new Error('The target balloon changed');
+    }, itemID, item => useItem(item, context));
 }
 
 function react(args) {
@@ -483,14 +517,13 @@ function replyComposer(context, target) {
     if (!current) return null;
     const focus = attr(context.app, 'AXFocusedUIElement');
     if (!focus || !$.CFEqual(focus, current.field)) return null;
-    const matches = targetBalloons(current.view, target);
-    if (matches.length !== 1) return null;
+    const matches = targetOwners(current.view, target);
+    if (matches.length !== 1 || !matches[0]) return null;
     // The thread's first message row must contain the target, not just a later reply.
-    const rows = value(current.view, 'AXVisibleChildren') || children(current.view);
+    const rows = visibleRows(current.view);
     if (!rows.length || role(rows[0]) !== 'AXButton' || value(rows[0], 'AXDescription') !== 'Dismiss replies') return null;
     const root = rows.find(row => children(row).some(el => identifier(el) === 'Sticker'));
-    const owner = target.kind ? matches[0] : attr(matches[0], 'AXParent');
-    const row = owner && attr(owner, 'AXParent');
+    const row = attr(matches[0], 'AXParent');
     return root && row && $.CFEqual(root, row) ? current : null;
 }
 
