@@ -194,6 +194,8 @@ type ui struct {
 	rowIndex, rowTop                int
 	search                          *paneSearch
 	newChat                         *newChatModal
+	helpOpen                        bool
+	helpTop                         int
 	drafts                          map[draftKey]*messageDraft
 	composeDraft                    draftKey
 	replyContext                    string
@@ -372,10 +374,32 @@ func (m *ui) clearHistory() {
 }
 
 func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if k, ok := msg.(tea.KeyMsg); ok {
+	switch k := msg.(type) {
+	case tea.KeyMsg:
 		key := k.String()
-		if key == "ctrl+c" || (key == "q" && m.focus != uiCompose && m.focus != uiEdit && m.search == nil && m.newChat == nil) {
+		if key == "ctrl+c" {
 			return m, tea.Quit
+		}
+		if m.helpOpen {
+			if !k.Paste {
+				m.helpKey(key)
+			}
+			return m, nil
+		}
+		if m.focus != uiCompose && m.focus != uiEdit && m.search == nil && m.newChat == nil {
+			switch key {
+			case "q":
+				return m, tea.Quit
+			case "?":
+				if !k.Paste {
+					m.helpOpen, m.helpTop = true, 0
+					return m, nil
+				}
+			}
+		}
+	case shiftEnterMsg:
+		if m.helpOpen {
+			return m, nil
 		}
 	}
 	wasHidden := m.focus == uiHidden
@@ -1504,6 +1528,13 @@ func (m *ui) View() string {
 	if m.width < 1 || m.height < 1 {
 		return ""
 	}
+	if m.helpOpen {
+		return m.helpView()
+	}
+	return m.mainView()
+}
+
+func (m *ui) mainView() string {
 	if m.newChat != nil {
 		return m.newChatView()
 	}
@@ -1624,7 +1655,8 @@ func (m *ui) historyLine(row int) string {
 		// Count placeholder cells without changing the graphics escapes.
 		cells = 2 + previewWidth
 		a := msg.Attachments[line.attachmentIndex]
-		if p := m.previews[a.key()]; p != nil && p.rows != nil {
+		// Keep the layout but omit graphics placeholders behind help.
+		if p := m.previews[a.key()]; !m.helpOpen && p != nil && p.rows != nil {
 			content = mark + p.rows[line.photoRow-1]
 		}
 	}
@@ -1651,13 +1683,13 @@ func (m *ui) footer() []string {
 	case m.search != nil:
 		lines = append(lines, m.search.prompt(m.width))
 	case m.focus == uiChats:
-		lines = append(lines, "h Hide  H Hidden  n New  Enter Open  / Search  p Pin/Unpin  ↑↓ Select  q Quit")
+		lines = append(lines, "? Help   h Hide  H Hidden  n New  Enter Open  / Search  p Pin/Unpin  ↑↓ Select  q Quit")
 	case m.focus == uiHidden:
 		keys := "H/Esc Back"
 		if len(m.hidden.chats) > 0 {
 			keys = "h Unhide   " + keys + "   / Search   ↑↓ Select"
 		}
-		lines = append(lines, keys)
+		lines = append(lines, "? Help   "+keys)
 	case m.focus == uiHistory:
 		keys := "/ Search   R Reply   c Copy   r React   i Compose   Esc Chats"
 		if len(m.rows) > 0 {
@@ -1684,7 +1716,7 @@ func (m *ui) footer() []string {
 			}
 			keys = key + " Mark Read   " + keys
 		}
-		lines = append(lines, keys)
+		lines = append(lines, "? Help   "+keys)
 	case m.focus == uiCompose || m.focus == uiEdit:
 		return m.composeFooter(limit)
 	case m.focus == uiReact:
@@ -1692,7 +1724,7 @@ func (m *ui) footer() []string {
 		if m.target.MyReaction != "" {
 			remove = "7 Remove reaction"
 		}
-		lines = strings.Split(ansi.Wrap(remove+"  1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
+		lines = strings.Split(ansi.Wrap("? Help  "+remove+"  1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
 	}
 	if status := m.status(); status != "" {
 		lines = append(lines[:min(len(lines), limit-1)], status)

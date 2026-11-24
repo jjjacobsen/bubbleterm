@@ -25,6 +25,8 @@ You can also launch **BubbleTerm** from the app launcher. For another SSH host, 
 
 ## Controls
 
+Press `?` outside text input to see all controls. Press `Esc` or `?` to close help
+
 | Key | Action |
 |---|---|
 | `j` / `k`, `Enter`, `Esc` | Navigate, open, go back |
