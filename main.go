@@ -674,6 +674,13 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	id := m.chats[m.chatIndex].ID
+	if (m.focus == uiChats || m.focus == uiHistory) && (key == "m" || key == "M") && !k.Paste {
+		if m.chats[m.chatIndex].Unread && m.viewing == 0 {
+			m.viewPending, m.viewErr, m.actionErr = 0, nil, nil
+			return m.markRead(id, false)
+		}
+		return nil
+	}
 	if (m.focus == uiChats || m.focus == uiHistory) && (key == "J" || key == "K") {
 		return m.moveChat(strings.ToLower(key))
 	}
@@ -735,8 +742,6 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 			}
 		case "shift+enter":
 			return m.copy(m.selectedLink())
-		case "m":
-			m.requestViewChat()
 		case "enter":
 			a := m.selectedAttachment()
 			if a.isPhoto() {
@@ -1683,7 +1688,7 @@ func (m *ui) footer() []string {
 	case m.search != nil:
 		lines = append(lines, m.search.prompt(m.width))
 	case m.focus == uiChats:
-		lines = append(lines, "? Help   h Hide  H Hidden  n New  Enter Open  / Search  p Pin/Unpin  ↑↓ Select  q Quit")
+		lines = append(lines, "? Help   m Mark Read  h Hide  H Hidden  n New  Enter Open  / Search  p Pin/Unpin  ↑↓ Select  q Quit")
 	case m.focus == uiHidden:
 		keys := "H/Esc Back"
 		if len(m.hidden.chats) > 0 {

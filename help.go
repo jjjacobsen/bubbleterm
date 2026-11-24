@@ -26,6 +26,7 @@ Enter, Tab, or →  Open history
 J/K  Select next/previous chat (also in history)
 n/N  Start a new chat
 p/P  Pin or unpin chat
+m/M  Mark selected chat read (also in history)
 h  Hide chat
 H  Show hidden chats
 
@@ -42,7 +43,6 @@ e  Edit an eligible sent iMessage
 c/C  Copy message
 Enter  Open photo, video, or link, or mark latest read
 Shift+Enter  Copy link
-m  Mark chat read at the latest message
 o  Load older messages
 Tab, Esc, or ←  Return to chats
 
