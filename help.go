@@ -11,6 +11,8 @@ const helpText = `BubbleTerm controls
 
 GENERAL
 ?  Open help outside text input
+Esc  Dismiss a footer error without leaving the pane
+F2  Show full details for the latest error, even after dismissal
 q  Quit from chats, hidden chats, history, or reactions
 Ctrl+C  Quit from any mode
 Ctrl+R  Refresh from chats, history, or reactions
@@ -82,30 +84,30 @@ Home/End  Move to start/end
 Backspace/Delete  Delete before/after cursor
 Type or paste text, including ?`
 
-func (m *ui) helpPage() (lines []string, width, height int, framed bool) {
+func (m *ui) overlayPage() (lines []string, width, height int, framed bool) {
 	width, height = max(1, m.width), max(1, m.height)
 	framed = width >= 32 && height >= 7
 	if framed {
 		width, height = min(76, width-8)-4, min(26, height-2)-2
 	}
-	text := ansi.Wrap(helpText, width, "")
+	text := ansi.Wrap(m.overlay, width, "")
 	lines = strings.Split(ansi.Hardwrap(text, width, true), "\n")
 	return lines, width, min(height, len(lines)), framed
 }
 
-func (m *ui) helpKey(key string) {
+func (m *ui) overlayKey(key string) {
 	if key == "esc" || key == "?" {
-		m.helpOpen = false
+		m.overlay = ""
 		return
 	}
-	lines, _, height, _ := m.helpPage()
+	lines, _, height, _ := m.overlayPage()
 	last := len(lines) - height
-	m.helpTop = min(last, moveIndex(key, min(m.helpTop, last), len(lines), height))
+	m.overlayTop = min(last, moveIndex(key, min(m.overlayTop, last), len(lines), height))
 }
 
-func (m *ui) helpView() string {
-	lines, width, height, framed := m.helpPage()
-	top := min(m.helpTop, len(lines)-height)
+func (m *ui) overlayView() string {
+	lines, width, height, framed := m.overlayPage()
+	top := min(m.overlayTop, len(lines)-height)
 	lines = lines[top : top+height]
 	if !framed {
 		return strings.Join(lines, "\n")
@@ -121,12 +123,12 @@ func (m *ui) helpView() string {
 	left, topRow := (m.width-width-4)/2, (m.height-height-2)/2
 	for i, line := range box {
 		row := topRow + i
-		background[row] = overlayHelpLine(background[row], line, left, left+width+4)
+		background[row] = overlayLine(background[row], line, left, left+width+4)
 	}
 	return strings.Join(background, "\n")
 }
 
-func overlayHelpLine(background, line string, left, right int) string {
+func overlayLine(background, line string, left, right int) string {
 	tail := ""
 	if width := ansi.StringWidth(background) - right; width > 0 {
 		tail = ansi.TruncateLeft(background, right, "")

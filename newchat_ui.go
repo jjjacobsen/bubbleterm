@@ -20,6 +20,7 @@ type newChatModal struct {
 	recipients []recipientOption
 	draft      messageDraft
 	composing  bool
+	loading    bool
 	sending    bool
 	uncertain  bool
 	err        error
@@ -43,7 +44,7 @@ func (m *ui) openNewChat() tea.Cmd {
 
 func (m *ui) loadDirectory() tea.Cmd {
 	s := m.newChat
-	s.err = nil
+	s.loading, s.err = true, nil
 	return func() tea.Msg {
 		dir, err := m.b.directory()
 		return directoryLoaded{s, dir, err}
@@ -54,6 +55,7 @@ func (m *ui) finishDirectory(msg directoryLoaded) {
 	if m.newChat != msg.modal {
 		return
 	}
+	m.newChat.loading = false
 	if msg.err != nil {
 		m.newChat.err = fmt.Errorf("load recipients: %w", msg.err)
 		return
@@ -80,7 +82,7 @@ func (m *ui) newChatKey(k tea.KeyMsg) tea.Cmd {
 		m.newChat = nil
 		return nil
 	}
-	if s.directory == nil && s.err != nil && k.Type == tea.KeyCtrlR {
+	if s.directory == nil && !s.loading && k.Type == tea.KeyCtrlR {
 		return m.loadDirectory()
 	}
 	if s.composing {
@@ -294,45 +296,30 @@ func recipientLabel(option recipientOption, width int) string {
 	return ansi.Truncate(name, width-ansi.StringWidth(address)-3, "…") + " · " + address
 }
 
+func (s *newChatModal) keys() string {
+	switch {
+	case s.composing:
+		return "Enter Send  Esc Cancel  Shift+Enter New Line  Tab Recipients"
+	case s.directory == nil:
+		return "Ctrl+R Retry  Esc Cancel"
+	case strings.TrimSpace(string(s.query.text)) != "":
+		return "Enter Select  Tab/↑↓ Choose  Esc Cancel"
+	case len(s.recipients) > 0:
+		return "Enter Continue  Backspace Remove  Esc Cancel"
+	default:
+		return "Type a name, phone, or email  Esc Cancel"
+	}
+}
+
 func (m *ui) newChatView() string {
 	s := m.newChat
 	title := "New chat"
-	var keys, status string
 	input, prefix := &s.query, "To> "
-	switch {
-	case s.sending:
-		title, keys, status = "New chat · First message", "", "Sending first message…"
-		input, prefix = &s.draft, "> "
-	case s.composing:
-		title, keys = "New chat · First message", "Enter Send  Shift+Enter New Line  Tab Recipients  Esc Cancel"
-		input, prefix = &s.draft, "> "
-	case s.directory == nil:
-		if s.err == nil {
-			keys, status = "Esc Cancel", "Loading recipients…"
-		} else {
-			keys = "Ctrl+R Retry  Esc Cancel"
-		}
-	case strings.TrimSpace(string(s.query.text)) != "":
-		keys = "Enter Select  Tab/↑↓ Choose  Esc Cancel"
-	case len(s.recipients) > 0:
-		keys = "Enter Continue  Backspace Remove  Esc Cancel"
-	default:
-		keys = "Type a name, phone, or email  Esc Cancel"
+	if s.composing {
+		title, input, prefix = "New chat · First message", &s.draft, "> "
 	}
-	if s.err != nil {
-		status = oneLine(s.err.Error())
-	}
-	wrap := func(text string, limit int) []string {
-		if text == "" || limit == 0 {
-			return nil
-		}
-		lines := strings.Split(ansi.Wrap(text, m.width, ""), "\n")
-		return lines[:min(len(lines), limit)]
-	}
-	hints := wrap(keys, min(3, (m.height+1)/3))
-	room := m.height - len(hints)
-	notice := wrap(status, min(3, room-1))
-	room -= len(notice)
+	bodyHeight := max(1, m.height-1)
+	room := bodyHeight
 	var lines []string
 	if room >= 3 {
 		lines = append(lines, title)
@@ -343,7 +330,8 @@ func (m *ui) newChatView() string {
 		for i, option := range s.recipients {
 			chips[i] = "[" + recipientLabel(option, m.width-2) + "]"
 		}
-		chipLines := wrap(fmt.Sprintf("To (%d): %s", len(chips), strings.Join(chips, " ")), room/2)
+		chipLines := strings.Split(ansi.Wrap(fmt.Sprintf("To (%d): %s", len(chips), strings.Join(chips, " ")), m.width, ""), "\n")
+		chipLines = chipLines[:min(len(chipLines), room/2)]
 		lines = append(lines, chipLines...)
 		room -= len(chipLines)
 	}
@@ -361,10 +349,12 @@ func (m *ui) newChatView() string {
 			lines = append(lines, marker(i == s.active)+recipientLabel(s.options[i], m.width-2))
 		}
 	}
-	lines = append(lines, notice...)
-	lines = append(lines, hints...)
 	for i, line := range lines {
 		lines[i] = ansi.Truncate(line, m.width, "")
+	}
+	lines = append(lines, make([]string, bodyHeight-len(lines))...)
+	if m.height >= 2 {
+		lines = append(lines, m.footer())
 	}
 	return strings.Join(lines, "\n")
 }

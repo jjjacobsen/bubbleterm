@@ -194,8 +194,8 @@ type ui struct {
 	rowIndex, rowTop                int
 	search                          *paneSearch
 	newChat                         *newChatModal
-	helpOpen                        bool
-	helpTop                         int
+	overlay, lastError              string
+	overlayTop                      int
 	drafts                          map[draftKey]*messageDraft
 	composeDraft                    draftKey
 	replyContext                    string
@@ -212,6 +212,7 @@ type ui struct {
 	moreHistory                     bool
 	writing, reconnecting           bool
 	videoActive                     bool
+	chatsFailed, historyFailed      bool // Keep retry and mark-read state after footer dismissal.
 	chatsErr, historyErr, actionErr error
 	watchErr                        error
 	lastWatchID                     int // cursor used only by the watch command
@@ -318,7 +319,7 @@ func (m *ui) loadChats() tea.Cmd {
 		m.chatsAgain = true
 		return nil
 	}
-	m.chatsBusy, m.chatsAgain = true, false
+	m.chatsBusy, m.chatsAgain, m.chatsErr = true, false, nil
 	return func() tea.Msg {
 		chats, unread, err := m.b.chats()
 		return chatsLoaded{chats, unread, err}
@@ -333,7 +334,7 @@ func (m *ui) loadHistory() tea.Cmd {
 		m.historyAgain = true
 		return nil
 	}
-	m.historyBusy, m.historyAgain = true, false
+	m.historyBusy, m.historyAgain, m.historyErr = true, false, nil
 	if m.historyLimit == 0 {
 		m.historyLimit = historyPageSize
 	}
@@ -363,7 +364,7 @@ func (m *ui) clearHistory() {
 	m.historyVersion++
 	m.historyLimit, m.moreHistory = 0, false
 	m.historyLatestID, m.historyLatestAt = 0, time.Time{}
-	m.rowIndex, m.rowTop, m.historyErr = 0, 0, nil
+	m.rowIndex, m.rowTop, m.historyErr, m.historyFailed = 0, 0, nil, false
 	if m.focus == uiCompose || m.focus == uiReact || m.focus == uiEdit {
 		m.focus = uiHistory
 	}
@@ -380,11 +381,21 @@ func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if key == "ctrl+c" {
 			return m, tea.Quit
 		}
-		if m.helpOpen {
+		if m.overlay != "" {
 			if !k.Paste {
-				m.helpKey(key)
+				m.overlayKey(key)
 			}
 			return m, nil
+		}
+		if key == "f2" && m.lastError != "" {
+			m.overlay, m.overlayTop = "Error details\n↑/↓ or k/j  Scroll   Esc  Close\n\n"+m.lastError, 0
+			return m, nil
+		}
+		if key == "esc" && m.search == nil && m.height >= 2 {
+			if _, err := m.footerError(); err != nil {
+				*err = nil
+				return m, nil
+			}
 		}
 		if m.focus != uiCompose && m.focus != uiEdit && m.search == nil && m.newChat == nil {
 			switch key {
@@ -392,19 +403,22 @@ func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "?":
 				if !k.Paste {
-					m.helpOpen, m.helpTop = true, 0
+					m.overlay, m.overlayTop = helpText, 0
 					return m, nil
 				}
 			}
 		}
 	case shiftEnterMsg:
-		if m.helpOpen {
+		if m.overlay != "" {
 			return m, nil
 		}
 	}
 	wasHidden := m.focus == uiHidden
 	cmd := m.update(msg)
 	view := m.maybeViewChat()
+	if prefix, err := m.footerError(); err != nil {
+		m.lastError = prefix + cleanText((*err).Error())
+	}
 	layout := m.layout()
 	m.keepSelectionVisible(layout)
 	if wasHidden || m.focus == uiHidden {
@@ -468,7 +482,7 @@ func (m *ui) maybeViewChat() tea.Cmd {
 		return nil
 	}
 	m.viewPending = 0
-	if m.chatsErr != nil || m.historyErr != nil {
+	if m.chatsFailed || m.historyFailed {
 		return nil
 	}
 	if !m.atLatestMessage() {
@@ -500,7 +514,7 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 			m.updateSearch()
 		}
 	case chatsLoaded:
-		m.chatsBusy, m.chatsErr = false, msg.err
+		m.chatsBusy, m.chatsErr, m.chatsFailed = false, msg.err, msg.err != nil
 		var history, again tea.Cmd
 		if msg.err == nil {
 			m.latestChats, m.unreadChats = msg.chats, msg.unread
@@ -527,7 +541,7 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 	case historyLoaded:
 		m.historyBusy = false
 		if msg.version == m.historyVersion && msg.limit == m.historyLimit && len(m.chats) > 0 && m.chats[m.chatIndex].ID == msg.id {
-			m.historyErr = msg.err
+			m.historyErr, m.historyFailed = msg.err, msg.err != nil
 			if msg.err == nil {
 				m.moreHistory = msg.more
 				messages := msg.messages
@@ -769,7 +783,7 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 		case "o":
 			if m.moreHistory {
 				limit := len(m.messages) + historyPageSize
-				if limit > m.historyLimit || m.historyErr != nil {
+				if limit > m.historyLimit || m.historyFailed {
 					m.historyLimit = max(limit, m.historyLimit)
 					return m.loadHistory()
 				}
@@ -1538,8 +1552,8 @@ func (m *ui) View() string {
 	if m.width < 1 || m.height < 1 {
 		return ""
 	}
-	if m.helpOpen {
-		return m.helpView()
+	if m.overlay != "" {
+		return m.overlayView()
 	}
 	return m.mainView()
 }
@@ -1575,7 +1589,9 @@ func (m *ui) mainView() string {
 	}
 	var lines []string
 	if sidebar := m.sidebarWidth(); sidebar > 0 {
-		lines = append(lines, pad(chatsTitle, sidebar)+" │ "+ansi.Truncate(title, m.historyWidth(), ""))
+		if layout.header {
+			lines = append(lines, pad(chatsTitle, sidebar)+" │ "+ansi.Truncate(title, m.historyWidth(), ""))
+		}
 		for i := range layout.bodyHeight {
 			lines = append(lines, pad(m.chatLine(i), sidebar)+" │ "+historyLine(i))
 		}
@@ -1585,13 +1601,15 @@ func (m *ui) mainView() string {
 			lines = append(lines, ansi.Truncate(m.chatLine(i), m.width, ""))
 		}
 	} else {
-		lines = append(lines, ansi.Truncate(title, m.width, ""))
+		if layout.header {
+			lines = append(lines, ansi.Truncate(title, m.width, ""))
+		}
 		for i := range layout.bodyHeight {
 			lines = append(lines, historyLine(i))
 		}
 	}
-	for _, line := range layout.footer {
-		lines = append(lines, ansi.Truncate(line, m.width, ""))
+	if m.height >= 2 {
+		lines = append(lines, m.footer())
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1601,8 +1619,8 @@ func (m *ui) chatLine(row int) string {
 		if len(m.hidden.chats) > 0 {
 			return "No visible chats"
 		}
-		if m.chatsBusy && m.chatsErr == nil {
-			return "Loading chats…"
+		if m.chatsBusy {
+			return ""
 		}
 		return "No chats"
 	}
@@ -1644,8 +1662,8 @@ func (m *ui) chatLine(row int) string {
 func (m *ui) historyLine(row int) string {
 	width := m.historyWidth()
 	if m.historyLimit > 0 && len(m.rows) == 0 && len(m.chats) > 0 && row == 0 {
-		if m.historyBusy && m.historyErr == nil {
-			return ansi.Truncate("Loading messages…", width, "")
+		if m.historyBusy {
+			return ""
 		}
 		return ansi.Truncate("No messages", width, "")
 	}
@@ -1677,8 +1695,8 @@ func (m *ui) historyLine(row int) string {
 		// Count placeholder cells without changing the graphics escapes.
 		cells = 2 + previewWidth
 		a := msg.Attachments[line.attachmentIndex]
-		// Keep the layout but omit graphics placeholders behind help.
-		if p := m.previews[a.key()]; !m.helpOpen && p != nil && p.rows != nil {
+		// Keep the layout but omit graphics placeholders behind overlays.
+		if p := m.previews[a.key()]; m.overlay == "" && p != nil && p.rows != nil {
 			content = mark + p.rows[line.photoRow-1]
 		}
 	}
@@ -1693,105 +1711,97 @@ func (m *ui) historyLine(row int) string {
 
 type paneLayout struct {
 	bodyHeight, historyHeight int
-	composer, footer          []string
+	composer                  []string
+	header                    bool
 }
 
 func (m *ui) layout() paneLayout {
-	footer := m.footer()
-	bodyHeight := max(0, m.height-1-len(footer))
+	header := m.height != 2 || !m.hasComposer() // Keep room for input in two rows.
+	bodyHeight := max(0, m.height-2)
+	if !header {
+		bodyHeight++
+	}
 	composer := m.composerLines(bodyHeight)
-	return paneLayout{bodyHeight, bodyHeight - len(composer), composer, footer}
+	return paneLayout{bodyHeight, bodyHeight - len(composer), composer, header}
 }
 
 func (m *ui) hasComposer() bool {
 	return len(m.chats) > 0 && m.focus != uiHidden && (m.sidebarWidth() > 0 || m.focus != uiChats)
 }
 
-const composeKeys = "Enter Send   Shift+Enter New Line   Esc Back   Ctrl+V Paste"
-const attachKey = "   Ctrl+O Attach"
-
-func (m *ui) footer() []string {
-	if m.width < 1 || m.height < 2 {
-		return nil
+func (m *ui) footer() string {
+	if m.search != nil {
+		return ansi.Truncate(m.search.prompt(m.width), m.width, "")
 	}
-	limit := max(1, m.height-2)
-	var lines []string
-	switch {
-	case m.search != nil:
-		lines = append(lines, m.search.prompt(m.width))
-	case m.focus == uiChats:
-		lines = append(lines, "? Help   i Compose  m Mark Read  h Hide  H Hidden  n New  Enter Open  / Search  p Pin/Unpin  ↑↓ Select  q Quit")
-	case m.focus == uiHidden:
-		keys := "H/Esc Back"
-		if len(m.hidden.chats) > 0 {
-			keys = "h Unhide   " + keys + "   / Search   ↑↓ Select"
+	if prefix, err := m.footerError(); err != nil {
+		firstLine, _, _ := strings.Cut((*err).Error(), "\n")
+		hints := "  Esc Dismiss  F2 Details"
+		if m.width < 40 {
+			hints = "  Esc  F2"
 		}
-		lines = append(lines, "? Help   "+keys)
-	case m.focus == uiHistory:
-		keys := "/ Search   R Reply   c Copy   r React   i Compose   Esc Chats"
+		if m.width < 16 {
+			hints = ""
+		}
+		return ansi.Truncate(prefix+oneLine(firstLine), min(64, m.width-len(hints)), "…") + hints
+	}
+	text := m.pendingStatus()
+	if text == "" {
+		text = m.footerKeys()
+	}
+	return ansi.Truncate(text, m.width, "…")
+}
+
+func (m *ui) footerKeys() string {
+	if m.newChat != nil {
+		return m.newChat.keys()
+	}
+	switch m.focus {
+	case uiChats:
+		return "? Help  Enter Open  / Search  i Compose  n New  m Read  p Pin  h Hide  H Hidden"
+	case uiHidden:
+		if len(m.hidden.chats) > 0 {
+			return "? Help  Esc Back  h Unhide  / Search"
+		}
+		return "? Help  Esc Back"
+	case uiHistory:
+		keys := "? Help  i Compose  / Search  Esc Chats"
+		a, link := m.selectedAttachment(), m.selectedLink()
+		switch {
+		case a.isPhoto():
+			keys += "  Enter Photo"
+		case a.isVideo():
+			keys += "  Enter Play"
+		case link != "":
+			keys += "  Enter Link"
+		case m.atLatestMessage() && m.chats[m.chatIndex].Unread && m.rows[m.rowIndex].attachmentIndex < 0:
+			keys += "  Enter Read"
+		}
+		if m.moreHistory {
+			keys += "  o Older"
+		}
 		if len(m.rows) > 0 {
 			item := m.messages[m.rows[m.rowIndex].messageIndex]
 			if item.Editable && item.withinEditWindow() {
-				keys = "e Edit   " + keys
+				keys += "  e Edit"
 			}
 		}
-		if m.moreHistory {
-			keys = "o Older   " + keys
-		}
-		a, link := m.selectedAttachment(), m.selectedLink()
-		if a.isPhoto() {
-			keys = "Enter Photo   " + keys
-		} else if a.isVideo() && !m.videoActive {
-			keys = "Enter Play   " + keys
-		} else if link != "" {
-			keys = "Enter Open Link   Shift+Enter Copy Link   " + keys
-		}
-		if m.atLatestMessage() && m.chats[m.chatIndex].Unread {
-			key := "m"
-			if !a.isPhoto() && !a.isVideo() && link == "" && m.rows[m.rowIndex].attachmentIndex < 0 {
-				key = "Enter"
-			}
-			keys = key + " Mark Read   " + keys
-		}
-		lines = append(lines, "? Help   "+keys)
-	case m.focus == uiCompose:
-		keys := composeKeys
+		return keys + "  R Reply  r React"
+	case uiCompose:
+		keys := "Enter Send  Esc Back  Shift+Enter New Line  Ctrl+V Paste"
 		if m.composeDraft.guid == "" {
-			keys += attachKey
+			keys += "  Ctrl+O Attach"
 		}
-		lines = strings.Split(ansi.Wrap(keys, m.width, ""), "\n")
-	case m.focus == uiEdit:
-		lines = strings.Split(ansi.Wrap("Enter Save   Shift+Enter New Line   Esc Cancel", m.width, ""), "\n")
-	case m.focus == uiReact:
-		remove := "No reaction to remove"
+		return keys
+	case uiEdit:
+		return "Enter Save  Esc Cancel  Shift+Enter New Line"
+	case uiReact:
+		keys := "? Help  Esc Back"
 		if m.target.MyReaction != "" {
-			remove = "7 Remove reaction"
+			keys += "  7 Remove"
 		}
-		lines = strings.Split(ansi.Wrap("? Help  "+remove+"  1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
+		return keys + "  1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question"
 	}
-	status := m.status()
-	if m.hasComposer() && m.focus != uiReact {
-		if m.height == 2 {
-			return nil // Keep the input visible below the header.
-		}
-		// Keep room for compose controls and status even when the input is not focused.
-		controls := strings.Count(ansi.Wrap(composeKeys+attachKey, m.width, ""), "\n") + 1
-		limit = min(max(1, m.height-3), max(1, m.height/3), controls+1)
-		if m.search == nil && (m.focus == uiChats || m.focus == uiHistory) {
-			lines = strings.Split(ansi.Wrap(lines[0], m.width, ""), "\n")
-		}
-		footer := make([]string, limit)
-		if status != "" {
-			limit--
-			footer[limit] = status
-		}
-		copy(footer[:limit], lines)
-		return footer
-	}
-	if status != "" {
-		lines = append(lines[:min(len(lines), limit-1)], status)
-	}
-	return lines[:min(len(lines), limit)]
+	return ""
 }
 
 func (m *ui) composerLines(height int) []string {
@@ -1857,36 +1867,58 @@ func (d *messageDraft) visibleLines(prefix string, width, limit int, focused boo
 	return lines[top:min(top+limit, len(lines))]
 }
 
-func (m *ui) status() string {
+func (m *ui) footerError() (prefix string, err *error) {
 	switch {
+	case m.newChat != nil:
+		if m.newChat.err != nil {
+			return "Error: ", &m.newChat.err
+		}
 	case m.actionErr != nil:
-		return "Action: " + oneLine(m.actionErr.Error())
+		return "Error: ", &m.actionErr
 	case m.focus == uiHidden:
-		return ""
+	case m.focus == uiCompose && m.drafts[m.composeDraft].inputErr != nil:
+		return "Error: ", &m.drafts[m.composeDraft].inputErr
+	case m.chatsErr != nil:
+		return "Chats: ", &m.chatsErr
+	case m.historyErr != nil:
+		return "History: ", &m.historyErr
+	case m.viewErr != nil && m.focus == uiHistory:
+		return "Mark read: ", &m.viewErr
+	case m.watchErr != nil:
+		return "Reconnecting: ", &m.watchErr
+	}
+	return "", nil
+}
+
+func (m *ui) pendingStatus() string {
+	switch {
+	case m.newChat != nil:
+		if m.newChat.sending {
+			return "Sending first message…"
+		}
+		if m.newChat.loading {
+			return "Loading recipients…"
+		}
+	case m.focus == uiHidden:
 	case m.upload != nil:
 		if m.upload.size > 0 && m.upload.sent >= m.upload.size {
-			return "Finishing upload. Waiting for send confirmation…"
+			return "Waiting for send confirmation…"
 		}
 		return fmt.Sprintf("Uploading: %d / %d bytes", m.upload.sent, m.upload.size)
-	case m.focus == uiCompose && m.drafts[m.composeDraft].inputErr != nil:
-		return "Action: " + oneLine(m.drafts[m.composeDraft].inputErr.Error())
+	case m.sending != nil:
+		return "Sending…"
 	case m.focus == uiCompose && m.drafts[m.composeDraft].input != "":
 		return m.drafts[m.composeDraft].input
-	case m.chatsErr != nil:
-		return "Chats: " + oneLine(m.chatsErr.Error())
-	case m.historyErr != nil:
-		return "History: " + oneLine(m.historyErr.Error())
-	case m.viewErr != nil && m.focus == uiHistory:
-		return "Open chat: " + oneLine(m.viewErr.Error())
-	case m.focus == uiHistory && len(m.chats) > 0 &&
-		(m.chats[m.chatIndex].ID == m.viewPending || m.chats[m.chatIndex].ID == m.viewing):
+	case m.viewPending != 0 || m.viewing != 0:
 		return "Waiting for Mac to mark chat read…"
 	case m.historyBusy && m.moreHistory && m.historyLimit > len(m.messages):
 		return "Loading older messages…"
 	case m.writing:
 		return "Working…"
-	case m.reconnecting && m.watchErr != nil:
-		return "Reconnecting: " + oneLine(m.watchErr.Error())
+	case m.chatsBusy && len(m.chats) == 0:
+		return "Loading chats…"
+	case m.historyBusy && len(m.rows) == 0:
+		return "Loading messages…"
 	case m.reconnecting:
 		return "Reconnecting…"
 	case m.videoActive:

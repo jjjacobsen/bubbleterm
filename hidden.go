@@ -53,8 +53,7 @@ func (m *ui) toggleHidden(c chat) {
 func (m *ui) hiddenView() string {
 	lines := []string{"Hidden chats"}
 	index, top := m.searchSelection(m.hiddenIndex, m.hiddenTop)
-	footer := m.footer()
-	for row := range m.height - 1 - len(footer) {
+	for row := range m.height - 2 {
 		i := top + row
 		switch {
 		case len(m.hidden.chats) == 0 && row == 0:
@@ -73,9 +72,11 @@ func (m *ui) hiddenView() string {
 			lines = append(lines, "")
 		}
 	}
-	lines = append(lines, footer...)
 	for i, line := range lines {
 		lines[i] = ansi.Truncate(line, m.width, "")
+	}
+	if m.height >= 2 {
+		lines = append(lines, m.footer())
 	}
 	return strings.Join(lines, "\n")
 }
