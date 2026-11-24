@@ -68,6 +68,7 @@ function resolveMedia(chat, guid, target, kind) {
     if (target.service !== 'iMessage' || !target.seconds) throw new Error('No usable media timestamp or sender direction');
     const minute = clock(target.seconds);
     // AX exposes only a clock time, not the date, file name, or GUID. Search all dates in the chat.
+    // Hidden link preview payloads are not photo or video balloons.
     const competitors = query(`
         SELECT DISTINCT m.date / 1000000000 + 978307200 AS seconds, a.mime_type AS mime
         FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
@@ -76,6 +77,8 @@ function resolveMedia(chat, guid, target, kind) {
         WHERE j.chat_id = ${chat} AND m.guid COLLATE BINARY <> ${guid}
           AND (m.is_from_me = ${target.outgoing} OR m.is_from_me IS NULL OR m.service IS NOT 'iMessage')
           AND NOT (m.is_audio_message IS 1 AND (a.mime_type IS NULL OR a.mime_type LIKE 'audio/%'))
+          AND NOT (m.balloon_bundle_id IS 'com.apple.messages.URLBalloonProvider' AND a.hide_attachment IS 1
+                   AND a.mime_type IS NULL AND coalesce(a.filename, '') GLOB '*.pluginPayloadAttachment')
           AND strftime('%M', m.date / 1000000000 + 978307200, 'unixepoch', 'localtime') =
               strftime('%M', ${target.seconds}, 'unixepoch', 'localtime')`);
     if (competitors.some(row => (!mediaKind(row.mime) || mediaKind(row.mime) === kind) && clock(row.seconds) === minute)) {
