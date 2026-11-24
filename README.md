@@ -1,5 +1,7 @@
 # BubbleTerm
 
+<img src="assets/bubbleterm.png" alt="BubbleTerm icon" width="128">
+
 A keyboard-driven Messages client for Linux. BubbleTerm runs in your terminal and connects over SSH to a Mac signed in to Messages. The Mac sends and receives messages. No public server or disabled SIP required
 
 ## Setup
@@ -18,10 +20,9 @@ A keyboard-driven Messages client for Linux. BubbleTerm runs in your terminal an
    ```sh
    mise install
    mise run install
-   bubbleterm
    ```
 
-You can also launch **BubbleTerm** from the app launcher. For another SSH host, run `bubbleterm -host HOST`. For development, run `mise run chat`
+Open **BubbleTerm** from the Omarchy app launcher or run `omarchy-launch-tui bubbleterm` to get a separate window with its own icon in `Super+Tab`. To run in your current terminal, use `bubbleterm`. For another SSH host, add `-host HOST`. For development, run `mise run chat`
 
 ## Controls
 
