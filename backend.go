@@ -18,12 +18,13 @@ import (
 type backend struct{ host string }
 
 type chat struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	IsGroup     bool   `json:"is_group"`
-	Unread      bool   `json:"unread"`
-	ContactName string `json:"contact_name,omitempty"`
-	Identifier  string `json:"identifier,omitempty"`
+	LastMessageAt time.Time `json:"last_message_at"`
+	ID            int       `json:"id"`
+	Name          string    `json:"name"`
+	IsGroup       bool      `json:"is_group"`
+	Unread        bool      `json:"unread"`
+	ContactName   string    `json:"contact_name,omitempty"`
+	Identifier    string    `json:"identifier,omitempty"`
 }
 
 type message struct {

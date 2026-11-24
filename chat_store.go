@@ -136,6 +136,9 @@ func (p *chatStore) order(latest []chat) []chat {
 		}
 		ordered = append(ordered, c)
 	}
+	slices.SortStableFunc(ordered, func(a, b chat) int {
+		return b.LastMessageAt.Compare(a.LastMessageAt)
+	})
 	for _, c := range latest {
 		if _, ok := byID[c.ID]; ok {
 			ordered = append(ordered, c)

@@ -479,6 +479,9 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		var history, again tea.Cmd
 		if msg.err == nil {
 			m.latestChats, m.unreadChats = msg.chats, msg.unread
+			if err := m.pins.refresh(m.latestChats); err != nil {
+				m.actionErr = fmt.Errorf("refresh pinned chats: %w", err)
+			}
 			if err := m.hidden.refresh(m.latestChats); err != nil {
 				m.actionErr = fmt.Errorf("refresh hidden chats: %w", err)
 			}
