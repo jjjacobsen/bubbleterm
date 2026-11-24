@@ -351,9 +351,9 @@ func (m *ui) newChatView() string {
 		prefix = ""
 	}
 	if s.composing {
-		lines = append(lines, input.visibleLines(prefix, m.width, room)...)
+		lines = append(lines, input.visibleLines(prefix, m.width, room, true)...)
 	} else {
-		query := input.visibleLines(prefix, m.width, min(2, max(1, room-1)))
+		query := input.visibleLines(prefix, m.width, min(2, max(1, room-1)), true)
 		lines = append(lines, query...)
 		count := room - len(query)
 		top := scrollTop(0, max(0, s.active), count, len(s.options))

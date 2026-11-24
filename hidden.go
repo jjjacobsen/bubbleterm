@@ -20,7 +20,7 @@ func (m *ui) hiddenKey(k tea.KeyMsg) tea.Cmd {
 			m.toggleHidden(m.hidden.chats[m.hiddenIndex])
 		}
 	default:
-		m.hiddenIndex = moveIndex(strings.ToLower(key), m.hiddenIndex, len(m.hidden.chats), m.bodyHeight())
+		m.hiddenIndex = moveIndex(strings.ToLower(key), m.hiddenIndex, len(m.hidden.chats), m.layout().bodyHeight)
 	}
 	return nil
 }

@@ -405,11 +405,12 @@ func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	wasHidden := m.focus == uiHidden
 	cmd := m.update(msg)
 	view := m.maybeViewChat()
-	m.keepSelectionVisible()
+	layout := m.layout()
+	m.keepSelectionVisible(layout)
 	if wasHidden || m.focus == uiHidden {
 		return m, tea.Batch(cmd, view)
 	}
-	return m, tea.Batch(cmd, view, m.loadPreviews())
+	return m, tea.Batch(cmd, view, m.loadPreviews(layout.historyHeight))
 }
 
 func (m *ui) followHistory(messages []message) bool {
@@ -892,7 +893,7 @@ func (m *ui) rebuildChats() {
 }
 
 func (m *ui) moveChat(key string) tea.Cmd {
-	next := moveIndex(key, m.chatIndex, len(m.chats), m.bodyHeight())
+	next := moveIndex(key, m.chatIndex, len(m.chats), m.layout().bodyHeight)
 	if next == m.chatIndex {
 		return nil
 	}
@@ -925,7 +926,7 @@ func (m *ui) moveHistory(key string) {
 		}
 		return
 	}
-	index = moveIndex(key, index, len(m.rows), m.bodyHeight())
+	index = moveIndex(key, index, len(m.rows), m.layout().historyHeight)
 	if m.rows[index].messageIndex < 0 {
 		if index > 0 && index < m.rowIndex {
 			index--
@@ -1429,7 +1430,7 @@ func (m *ui) thumbnailSpace() bool {
 	return m.g.supported && m.historyWidth() >= previewWidth+2 && m.height >= previewHeight+4
 }
 
-func (m *ui) loadPreviews() tea.Cmd {
+func (m *ui) loadPreviews(height int) tea.Cmd {
 	// Keep the cache while a modal or search changes what is visible.
 	if m.newChat != nil || m.search != nil {
 		return nil
@@ -1443,7 +1444,7 @@ func (m *ui) loadPreviews() tea.Cmd {
 	// has a new identity, so results from an earlier view are ignored.
 	visible := make(map[string]*photoPreview)
 	var cmds []tea.Cmd
-	end := min(len(m.rows), m.rowTop+m.bodyHeight())
+	end := min(len(m.rows), m.rowTop+height)
 	for _, row := range m.rows[m.rowTop:end] {
 		if row.photoRow == 0 {
 			continue
@@ -1502,12 +1503,13 @@ func (m *ui) scrollChats(top, index, height int) int {
 	return top
 }
 
-func (m *ui) keepSelectionVisible() {
-	height := max(1, m.bodyHeight())
-	m.chatTop = m.scrollChats(m.chatTop, m.chatIndex, height)
+func (m *ui) keepSelectionVisible(layout paneLayout) {
+	bodyHeight := max(1, layout.bodyHeight)
+	m.chatTop = m.scrollChats(m.chatTop, m.chatIndex, bodyHeight)
 	if m.focus == uiHidden {
-		m.hiddenTop = scrollTop(m.hiddenTop, m.hiddenIndex, height, len(m.hidden.chats))
+		m.hiddenTop = scrollTop(m.hiddenTop, m.hiddenIndex, bodyHeight, len(m.hidden.chats))
 	}
+	height := max(1, layout.historyHeight)
 	m.rowTop = scrollTop(m.rowTop, m.rowIndex, height, len(m.rows))
 	if len(m.rows) > 0 {
 		start := m.rowIndex - m.rows[m.rowIndex].photoRow
@@ -1521,6 +1523,9 @@ func (m *ui) keepSelectionVisible() {
 		}
 	}
 	if m.search != nil {
+		if m.searchingChats() {
+			height = bodyHeight
+		}
 		m.keepSearchVisible(height)
 	}
 }
@@ -1546,8 +1551,13 @@ func (m *ui) mainView() string {
 	if m.focus == uiHidden {
 		return m.hiddenView()
 	}
-	footer := m.footer()
-	height := max(0, m.height-1-len(footer))
+	layout := m.layout()
+	historyLine := func(row int) string {
+		if row >= layout.historyHeight {
+			return layout.composer[row-layout.historyHeight]
+		}
+		return m.historyLine(row)
+	}
 	title := "History"
 	if len(m.chats) > 0 {
 		c := m.chats[m.chatIndex]
@@ -1559,21 +1569,21 @@ func (m *ui) mainView() string {
 	var lines []string
 	if sidebar := m.sidebarWidth(); sidebar > 0 {
 		lines = append(lines, pad("Chats", sidebar)+" │ "+ansi.Truncate(title, m.historyWidth(), ""))
-		for i := range height {
-			lines = append(lines, pad(m.chatLine(i), sidebar)+" │ "+m.historyLine(i))
+		for i := range layout.bodyHeight {
+			lines = append(lines, pad(m.chatLine(i), sidebar)+" │ "+historyLine(i))
 		}
 	} else if m.focus == uiChats {
 		lines = append(lines, ansi.Truncate("Chats", m.width, ""))
-		for i := range height {
+		for i := range layout.bodyHeight {
 			lines = append(lines, ansi.Truncate(m.chatLine(i), m.width, ""))
 		}
 	} else {
 		lines = append(lines, ansi.Truncate(title, m.width, ""))
-		for i := range height {
-			lines = append(lines, m.historyLine(i))
+		for i := range layout.bodyHeight {
+			lines = append(lines, historyLine(i))
 		}
 	}
-	for _, line := range footer {
+	for _, line := range layout.footer {
 		lines = append(lines, ansi.Truncate(line, m.width, ""))
 	}
 	return strings.Join(lines, "\n")
@@ -1674,9 +1684,24 @@ func (m *ui) historyLine(row int) string {
 	return content
 }
 
-func (m *ui) bodyHeight() int {
-	return max(0, m.height-1-len(m.footer()))
+type paneLayout struct {
+	bodyHeight, historyHeight int
+	composer, footer          []string
 }
+
+func (m *ui) layout() paneLayout {
+	footer := m.footer()
+	bodyHeight := max(0, m.height-1-len(footer))
+	composer := m.composerLines(bodyHeight)
+	return paneLayout{bodyHeight, bodyHeight - len(composer), composer, footer}
+}
+
+func (m *ui) hasComposer() bool {
+	return len(m.chats) > 0 && m.focus != uiHidden && (m.sidebarWidth() > 0 || m.focus != uiChats)
+}
+
+const composeKeys = "Enter Send   Shift+Enter New Line   Esc Back   Ctrl+V Paste"
+const attachKey = "   Ctrl+O Attach"
 
 func (m *ui) footer() []string {
 	if m.width < 1 || m.height < 2 {
@@ -1688,7 +1713,7 @@ func (m *ui) footer() []string {
 	case m.search != nil:
 		lines = append(lines, m.search.prompt(m.width))
 	case m.focus == uiChats:
-		lines = append(lines, "? Help   m Mark Read  h Hide  H Hidden  n New  Enter Open  / Search  p Pin/Unpin  ↑↓ Select  q Quit")
+		lines = append(lines, "? Help   i Compose  m Mark Read  h Hide  H Hidden  n New  Enter Open  / Search  p Pin/Unpin  ↑↓ Select  q Quit")
 	case m.focus == uiHidden:
 		keys := "H/Esc Back"
 		if len(m.hidden.chats) > 0 {
@@ -1722,8 +1747,14 @@ func (m *ui) footer() []string {
 			keys = key + " Mark Read   " + keys
 		}
 		lines = append(lines, "? Help   "+keys)
-	case m.focus == uiCompose || m.focus == uiEdit:
-		return m.composeFooter(limit)
+	case m.focus == uiCompose:
+		keys := composeKeys
+		if m.composeDraft.guid == "" {
+			keys += attachKey
+		}
+		lines = strings.Split(ansi.Wrap(keys, m.width, ""), "\n")
+	case m.focus == uiEdit:
+		lines = strings.Split(ansi.Wrap("Enter Save   Shift+Enter New Line   Esc Cancel", m.width, ""), "\n")
 	case m.focus == uiReact:
 		remove := "No reaction to remove"
 		if m.target.MyReaction != "" {
@@ -1731,61 +1762,81 @@ func (m *ui) footer() []string {
 		}
 		lines = strings.Split(ansi.Wrap("? Help  "+remove+"  1 Love  2 Like  3 Dislike  4 Laugh  5 Emphasize  6 Question  Esc Back", m.width, ""), "\n")
 	}
-	if status := m.status(); status != "" {
+	status := m.status()
+	if m.hasComposer() && m.focus != uiReact {
+		if m.height == 2 {
+			return nil // Keep the input visible below the header.
+		}
+		// Keep room for compose controls and status even when the input is not focused.
+		controls := strings.Count(ansi.Wrap(composeKeys+attachKey, m.width, ""), "\n") + 1
+		limit = min(max(1, m.height-3), max(1, m.height/3), controls+1)
+		if m.search == nil && (m.focus == uiChats || m.focus == uiHistory) {
+			lines = strings.Split(ansi.Wrap(lines[0], m.width, ""), "\n")
+		}
+		footer := make([]string, limit)
+		if status != "" {
+			limit--
+			footer[limit] = status
+		}
+		copy(footer[:limit], lines)
+		return footer
+	}
+	if status != "" {
 		lines = append(lines[:min(len(lines), limit-1)], status)
 	}
 	return lines[:min(len(lines), limit)]
 }
 
-func (m *ui) composeFooter(limit int) []string {
-	draft := m.drafts[m.composeDraft]
+func (m *ui) composerLines(height int) []string {
+	if height == 0 || !m.hasComposer() {
+		return nil
+	}
+	width := m.historyWidth()
+	inner := width
+	if width >= 8 {
+		inner -= 4 // reserve the two sides of the box and their padding
+	}
+	prefix, context := "> ", ""
+	key := draftKey{chatID: m.chats[m.chatIndex].ID}
+	if m.focus == uiCompose {
+		key = m.composeDraft
+	}
+	draft := m.drafts[key]
 	if m.focus == uiEdit {
-		draft = &m.editor.draft
+		draft, prefix = &m.editor.draft, "Edit> "
+	} else if key.guid != "" {
+		context = "Reply to " + m.replyContext
+	} else if draft != nil && draft.file != nil {
+		prefix, context = "Caption> ", "Ctrl+X Remove: "+oneLine(draft.file.Name)
 	}
-	status := m.status()
-	if limit == 1 {
-		status = ""
-	} else if status != "" {
-		limit--
+	if draft == nil {
+		draft = &messageDraft{}
 	}
-	var lines []string
-	if limit > 1 && m.focus == uiCompose {
-		if m.composeDraft.guid != "" {
-			lines = append(lines, "Reply to "+m.replyContext)
-		} else if draft.file != nil {
-			lines = append(lines, "Ctrl+X Remove: "+oneLine(draft.file.Name))
-		}
-	}
-	prefix := "> "
-	if m.focus == uiEdit {
-		prefix = "Edit> "
-	} else if draft.file != nil {
-		prefix = "Caption> "
-	}
-	if m.width <= len(prefix) {
+	if inner <= len(prefix) {
 		prefix = ""
 	}
-	const maxDraftLines = 5
-	draftHeight := min(maxDraftLines, max(1, limit-len(lines)-1))
-	lines = append(lines, draft.visibleLines(prefix, m.width, draftHeight)...)
-	if len(lines) < limit {
-		keys := "Enter Send   Shift+Enter New Line   Esc Back   Ctrl+V Paste"
-		if m.focus == uiEdit {
-			keys = "Enter Save   Shift+Enter New Line   Esc Cancel"
-		} else if m.composeDraft.guid == "" {
-			keys += "   Ctrl+O Attach"
-		}
-		help := strings.Split(ansi.Wrap(keys, m.width, ""), "\n")
-		lines = append(lines, help[:min(len(help), limit-len(lines))]...)
+	room := max(1, height-1) // leave one history row if there is room
+	var lines []string
+	if context != "" && room > 1 {
+		lines = append(lines, ansi.Truncate(context, width, ""))
+		room--
 	}
-	if status != "" {
-		lines = append(lines, status)
+	focused := m.focus == uiCompose || m.focus == uiEdit
+	for _, line := range draft.visibleLines(prefix, inner, min(5, room), focused) {
+		if inner < width {
+			line = "[ " + pad(line, inner) + " ]"
+		}
+		lines = append(lines, ansi.Truncate(line, width, ""))
 	}
 	return lines
 }
 
-func (d *messageDraft) visibleLines(prefix string, width, limit int) []string {
-	before := prefix + cleanText(string(d.text[:d.cursor])) + "▏"
+func (d *messageDraft) visibleLines(prefix string, width, limit int, focused bool) []string {
+	cursor := " " // Reserve the same cell before and after focus.
+	if focused {
+		cursor = "▏"
+	}
+	before := prefix + cleanText(string(d.text[:d.cursor])) + cursor
 	lines := strings.Split(ansi.Hardwrap(before, width, true), "\n")
 	cursorRow := len(lines) - 1
 	tail := ansi.Hardwrap(lines[cursorRow]+cleanText(string(d.text[d.cursor:])), width, true)
