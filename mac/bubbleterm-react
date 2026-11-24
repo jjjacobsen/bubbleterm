@@ -87,7 +87,24 @@ function resolveMedia(chat, guid, target, kind) {
     return { ...target, kind, minute, part: 0 };
 }
 
-function resolveTarget(chat, guid, filename) {
+function uniqueTextMinute(chat, guid, target, text) {
+    const minute = clock(target.seconds);
+    const needle = sqlQuote(text);
+    // AX has no date. Check all dates and directions, including captions and edits.
+    const competitors = query(`
+        SELECT CASE WHEN m.date > 0 THEN m.date / 1000000000 + 978307200 END AS seconds
+        FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
+        WHERE j.chat_id = ${chat} AND m.guid COLLATE BINARY <> ${guid}
+          AND COALESCE(m.associated_message_type, 0) = 0
+          AND (COALESCE(m.date_edited, 0) <> 0 OR instr(m.text, ${needle}) > 0
+               OR instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0)`);
+    if (competitors.some(row => !row.seconds || clock(row.seconds) === minute)) {
+        throw new Error('Target text and clock time do not identify a unique balloon in this chat');
+    }
+    return minute;
+}
+
+function resolveTarget(chat, guid, filename, allowTextMinute = false) {
     const mentionMarker = "CAST('__kIMMentionConfirmedMention' AS BLOB)";
     const rows = query(`
         SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, c.service_name AS chatService,
@@ -151,8 +168,13 @@ function resolveTarget(chat, guid, filename) {
                OR (instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0
                    AND (m.text IS NULL OR instr(m.attributedBody, x'EFBFBC') > 0)))`)
         .filter(row => row.text === text || messageText({ ...row, text: null }).split('\ufffc').includes(text));
+    let textMinute = null;
     if (duplicates.some(row => row.outgoing === target.outgoing)) {
-        throw new Error('Target text is not unique for that sender direction in this chat');
+        if (!allowTextMinute || files.length || target.parts !== 1 || target.service !== 'iMessage' ||
+            !(target.seconds > 978307200) || target.calendarEvent || target.mention) {
+            throw new Error('Target text is not unique for that sender direction in this chat');
+        }
+        textMinute = uniqueTextMinute(chat, guid, target, text);
     }
     const descriptionMinute = !files.length && target.parts === 1 && target.service === 'iMessage' &&
         target.seconds && (target.calendarEvent || target.mention) ? clock(target.seconds) : null;
@@ -173,7 +195,7 @@ function resolveTarget(chat, guid, filename) {
         if (!competitors.some(row => clock(row.seconds) === descriptionMinute)) mentionMinute = descriptionMinute;
     }
     const calendarMinute = target.calendarEvent ? descriptionMinute : null;
-    return { ...target, text, part, calendarMinute, mentionMinute, ambiguousDirection: duplicates.length > 0 };
+    return { ...target, text, part, textMinute, calendarMinute, mentionMinute, ambiguousDirection: duplicates.length > 0 };
 }
 
 function attr(element, name) {
@@ -287,6 +309,19 @@ function targetOwners(view, target) {
                 throw new Error('Cannot isolate the media button in the matching row');
             }
             return buttons;
+        });
+    }
+    if (target.textMinute) {
+        if (value(view, 'AXDescription') !== 'Messages') return [];
+        return visible.flatMap(row => {
+            const description = value(row, 'AXDescription');
+            const separator = description?.indexOf(', ') ?? -1;
+            if (separator < 1 || description.slice(separator + 2) !== target.text + ', ' + target.textMinute) return [];
+            const sender = description.slice(0, separator);
+            if (target.outgoing ? sender !== 'Your iMessage' : sender.startsWith('Your ')) return [];
+            return children(row).filter(owner => role(owner) === 'AXGroup' && identifier(owner) === 'Sticker' &&
+                value(owner, 'AXDescription') === description && children(owner).filter(balloon =>
+                    identifier(balloon) === 'CKBalloonTextView' && value(balloon, 'AXValue') === target.text).length === 1);
         });
     }
     return visible.flatMap(row => {
@@ -426,7 +461,7 @@ function react(args) {
         (!removing && reaction < 0)) {
         throw new Error('Usage: bubbleterm-react [--check|--dry-run] CHAT_ID MESSAGE_GUID love|like|dislike|laugh|emphasis|question|remove [--attachment FILENAME]');
     }
-    const target = resolveTarget(chat, sqlQuote(guid), filename);
+    const target = resolveTarget(chat, sqlQuote(guid), filename, true);
     if (!removing && mode) return withTargetMenu(target, tapbacks[reaction][1], mode, () => 'Tapback target verified. No reaction sent.');
     if (removing && !target.kind && target.parts !== target.part + 1) {
         throw new Error('Cannot isolate the selected text part');
