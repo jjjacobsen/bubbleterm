@@ -273,12 +273,10 @@ func (m *ui) openDirectoryChat(c chat) tea.Cmd {
 		m.newChat.err = errHiddenChat
 		return nil
 	}
-	m.newChat, m.openedChat, m.focus, m.actionErr = nil, &c, uiHistory, nil
+	m.newChat, m.directoryChat, m.actionErr = nil, &c, nil
 	m.rebuildChats()
 	m.chatIndex = chatIndex(m.chats, c.ID)
-	history := m.resetHistory()
-	m.requestViewChat()
-	return history
+	return m.openSelectedChat(true)
 }
 
 func recipientLabel(option recipientOption, width int) string {

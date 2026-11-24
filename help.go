@@ -25,10 +25,10 @@ Home/End or </>  Move to first/last
 
 CHATS
 Enter, Tab, or →  Open history
-J/K  Select next/previous chat (also in history)
+J/K  Select next/previous chat in the chat list (also from history)
 n/N  Start a new chat
 p/P  Pin or unpin chat
-m/M  Mark selected chat read (also in history)
+m/M  Mark selected chat read (or opened chat from history)
 h  Hide chat
 H  Show hidden chats
 
@@ -64,7 +64,7 @@ Ctrl+X  Remove attachment
 SEARCH
 /  Search chats, hidden chats, or loaded history
 Ctrl+J/Ctrl+K  Select next/previous match
-Enter  Jump to match
+Enter  Jump to match (chat list: select without opening)
 Esc  Cancel search
 
 NEW CHAT

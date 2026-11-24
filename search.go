@@ -59,11 +59,7 @@ func (m *ui) searchKey(k tea.KeyMsg) tea.Cmd {
 			case uiHidden:
 				m.hiddenTop, m.hiddenIndex = s.top, hit.first
 			case uiChats:
-				m.chatTop = s.top
-				if hit.first != m.chatIndex {
-					m.chatIndex = hit.first
-					return m.resetHistory()
-				}
+				m.chatTop, m.chatIndex = s.top, hit.first
 			}
 		}
 	case tea.KeyCtrlJ, tea.KeyCtrlK:

@@ -49,8 +49,8 @@ type historyLoaded struct {
 }
 
 type chatViewed struct {
-	afterSend bool
-	err       error
+	action string
+	err    error
 }
 
 type draftKey struct {
@@ -180,7 +180,8 @@ type ui struct {
 	pins, hidden                    *chatStore
 	latestChats, chats              []chat
 	unreadChats                     map[int]bool
-	openedChat                      *chat  // keep a chat opened outside the recent list
+	historyChat                     chat   // independent of the chat list cursor
+	directoryChat                   *chat  // keep a chat opened outside the recent list
 	restoredChats                   []chat // keep older unhidden chats available for this session
 	pinnedCount, chatIndex, chatTop int
 	hiddenIndex, hiddenTop          int
@@ -327,7 +328,7 @@ func (m *ui) loadChats() tea.Cmd {
 }
 
 func (m *ui) loadHistory() tea.Cmd {
-	if m.focus == uiHidden || len(m.chats) == 0 {
+	if m.focus == uiHidden || m.historyChat.ID == 0 {
 		return nil
 	}
 	if m.historyBusy {
@@ -338,7 +339,7 @@ func (m *ui) loadHistory() tea.Cmd {
 	if m.historyLimit == 0 {
 		m.historyLimit = historyPageSize
 	}
-	id, limit, version := m.chats[m.chatIndex].ID, m.historyLimit, m.historyVersion
+	id, limit, version := m.historyChat.ID, m.historyLimit, m.historyVersion
 	return func() tea.Msg {
 		messages, more, err := m.b.history(id, limit)
 		return historyLoaded{id, limit, version, messages, more, err}
@@ -349,29 +350,31 @@ func (m *ui) refresh() tea.Cmd {
 	return tea.Batch(m.loadChats(), m.loadHistory())
 }
 
-func (m *ui) resetHistory() tea.Cmd {
-	m.clearHistory()
+func (m *ui) openSelectedChat(markViewed bool) tea.Cmd {
+	c := m.chats[m.chatIndex]
+	if m.historyChat.ID != c.ID {
+		m.clearHistory()
+	}
+	m.historyChat, m.focus = c, uiHistory
+	if markViewed {
+		m.requestViewChat()
+	}
 	return m.loadHistory()
 }
 
 func (m *ui) clearHistory() {
+	m.historyChat = chat{}
 	m.viewPending, m.viewErr, m.historyAgain = 0, nil, false
 	m.messages, m.rows, m.historySearch = nil, nil, nil
-	if m.focus == uiHistory {
-		m.search = nil
+	if !m.searchingChats() {
+		m.focus, m.search = uiChats, nil
 	}
 	clear(m.previews)
 	m.historyVersion++
 	m.historyLimit, m.moreHistory = 0, false
 	m.historyLatestID, m.historyLatestAt = 0, time.Time{}
 	m.rowIndex, m.rowTop, m.historyErr, m.historyFailed = 0, 0, nil, false
-	if m.focus == uiCompose || m.focus == uiReact || m.focus == uiEdit {
-		m.focus = uiHistory
-	}
 	m.editor = nil
-	if len(m.chats) == 0 && m.focus != uiHidden {
-		m.focus = uiChats
-	}
 }
 
 func (m *ui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -451,7 +454,7 @@ func (m *ui) atLatestMessage() bool {
 }
 
 func (m *ui) requestViewChat() {
-	c := m.chats[m.chatIndex]
+	c := m.historyChat
 	if c.Unread && c.ID != m.viewing && (len(m.rows) == 0 || m.atLatestMessage()) {
 		m.viewPending, m.viewErr, m.actionErr = c.ID, nil, nil
 	}
@@ -465,14 +468,14 @@ func (m *ui) maybeViewChat() tea.Cmd {
 			m.viewPending = 0
 		}
 		// Only the Mac can tell whether the destination is still unread.
-		return m.markRead(id, true)
+		return m.markRead(id, fmt.Sprintf("message sent to chat %d, but could not mark it read", id))
 	}
 	id := m.viewPending
 	if id == 0 {
 		return nil
 	}
-	if m.focus != uiHistory || m.search != nil || m.terminalBlurred || len(m.chats) == 0 ||
-		m.chats[m.chatIndex].ID != id || !m.chats[m.chatIndex].Unread ||
+	if m.focus != uiHistory || m.search != nil || m.terminalBlurred ||
+		m.historyChat.ID != id || !m.historyChat.Unread ||
 		(len(m.rows) > 0 && !m.atLatestMessage()) {
 		m.viewPending = 0
 		return nil
@@ -489,12 +492,12 @@ func (m *ui) maybeViewChat() tea.Cmd {
 		m.viewErr = errors.New("latest message is not available")
 		return nil
 	}
-	return m.markRead(id, false)
+	return m.markRead(id, "")
 }
 
-func (m *ui) markRead(id int, afterSend bool) tea.Cmd {
+func (m *ui) markRead(id int, action string) tea.Cmd {
 	m.viewing = id
-	return func() tea.Msg { return chatViewed{afterSend, m.b.viewChat(id)} }
+	return func() tea.Msg { return chatViewed{action, m.b.viewChat(id)} }
 }
 
 func (m *ui) update(msg tea.Msg) tea.Cmd {
@@ -515,7 +518,6 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		}
 	case chatsLoaded:
 		m.chatsBusy, m.chatsErr, m.chatsFailed = false, msg.err, msg.err != nil
-		var history, again tea.Cmd
 		if msg.err == nil {
 			m.latestChats, m.unreadChats = msg.chats, msg.unread
 			if err := m.pins.refresh(m.latestChats); err != nil {
@@ -524,23 +526,17 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 			if err := m.hidden.refresh(m.latestChats); err != nil {
 				m.actionErr = fmt.Errorf("refresh hidden chats: %w", err)
 			}
-			if m.reselectChats() {
-				history = m.resetHistory()
-			}
-			if len(m.chats) > 0 && !m.chats[m.chatIndex].Unread {
-				m.viewErr = nil
-			}
+			m.reselectChats()
 			if m.search != nil && m.searchingChats() {
 				m.updateSearch()
 			}
 		}
 		if m.chatsAgain {
-			again = m.loadChats()
+			return m.loadChats()
 		}
-		return tea.Batch(history, again)
 	case historyLoaded:
 		m.historyBusy = false
-		if msg.version == m.historyVersion && msg.limit == m.historyLimit && len(m.chats) > 0 && m.chats[m.chatIndex].ID == msg.id {
+		if msg.version == m.historyVersion && msg.limit == m.historyLimit && m.historyChat.ID == msg.id {
 			m.historyErr, m.historyFailed = msg.err, msg.err != nil
 			if msg.err == nil {
 				m.moreHistory = msg.more
@@ -566,14 +562,14 @@ func (m *ui) update(msg tea.Msg) tea.Cmd {
 		id := m.viewing
 		m.viewing = 0
 		if msg.err == nil {
-			if m.openedChat != nil && m.openedChat.ID == id {
-				m.openedChat.Unread = false
+			if m.directoryChat != nil && m.directoryChat.ID == id {
+				m.directoryChat.Unread = false
 			}
 			return m.loadChats()
 		}
-		if msg.afterSend {
-			m.actionErr = fmt.Errorf("message sent to chat %d, but could not mark it read: %w", id, msg.err)
-		} else if len(m.chats) > 0 && m.chats[m.chatIndex].ID == id && m.chats[m.chatIndex].Unread {
+		if msg.action != "" {
+			m.actionErr = fmt.Errorf("%s: %w", msg.action, msg.err)
+		} else if m.historyChat.ID == id && m.historyChat.Unread {
 			m.viewErr = msg.err
 		}
 	case previewLoaded:
@@ -688,16 +684,21 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 	if len(m.chats) == 0 {
 		return nil
 	}
-	id := m.chats[m.chatIndex].ID
+	c := m.historyChat
+	if m.focus == uiChats {
+		c = m.chats[m.chatIndex]
+	}
+	id := c.ID
 	if (m.focus == uiChats || m.focus == uiHistory) && (key == "m" || key == "M") && !k.Paste {
-		if m.chats[m.chatIndex].Unread && m.viewing == 0 {
+		if c.Unread && m.viewing == 0 {
 			m.viewPending, m.viewErr, m.actionErr = 0, nil, nil
-			return m.markRead(id, false)
+			return m.markRead(id, fmt.Sprintf("could not mark chat %d read", id))
 		}
 		return nil
 	}
 	if (m.focus == uiChats || m.focus == uiHistory) && (key == "J" || key == "K") {
-		return m.moveChat(strings.ToLower(key))
+		m.moveChat(strings.ToLower(key))
+		return nil
 	}
 	switch m.focus {
 	case uiCompose:
@@ -716,26 +717,24 @@ func (m *ui) key(k tea.KeyMsg) tea.Cmd {
 	case uiChats:
 		switch key {
 		case "tab", "enter", "right":
-			m.focus = uiHistory
-			m.requestViewChat()
-			return m.loadHistory()
+			return m.openSelectedChat(true)
 		case "i":
+			history := m.openSelectedChat(false)
 			m.startCompose(draftKey{chatID: id}, "")
+			return history
 		case "p", "P":
 			if err := m.pins.toggle(m.chats[m.chatIndex]); err != nil {
 				m.actionErr = fmt.Errorf("toggle pin: %w", err)
 				return nil
 			}
 			m.actionErr = nil
-			if m.reselectChats() {
-				return m.resetHistory()
-			}
+			m.reselectChats()
 		case "h":
 			if !k.Paste {
 				m.toggleHidden(m.chats[m.chatIndex])
 			}
 		default:
-			return m.moveChat(key)
+			m.moveChat(key)
 		}
 	case uiHistory:
 		switch key {
@@ -853,8 +852,7 @@ func (m *ui) selectedLink() string {
 	return ""
 }
 
-// Keep the same selection when possible. The caller decides whether to load history.
-func (m *ui) reselectChats() bool {
+func (m *ui) reselectChats() {
 	selected := 0
 	if len(m.chats) > 0 {
 		selected = m.chats[m.chatIndex].ID
@@ -862,15 +860,24 @@ func (m *ui) reselectChats() bool {
 	m.rebuildChats()
 	if i := chatIndex(m.chats, selected); i >= 0 {
 		m.chatIndex = i
-		return false
+	} else {
+		m.chatIndex = min(m.chatIndex, max(0, len(m.chats)-1))
 	}
-	m.chatIndex = min(m.chatIndex, max(0, len(m.chats)-1))
-	return selected != 0 || len(m.chats) > 0
+	if m.historyChat.ID != 0 {
+		if i := chatIndex(m.chats, m.historyChat.ID); i >= 0 {
+			m.historyChat = m.chats[i]
+			if !m.historyChat.Unread {
+				m.viewErr = nil
+			}
+		} else {
+			m.clearHistory()
+		}
+	}
 }
 
 func (m *ui) rebuildChats() {
 	latest := m.latestChats
-	if opened := m.openedChat; opened != nil {
+	if opened := m.directoryChat; opened != nil {
 		if i := chatIndex(latest, opened.ID); i >= 0 {
 			*opened = latest[i]
 		} else {
@@ -906,13 +913,11 @@ func (m *ui) rebuildChats() {
 	}
 }
 
-func (m *ui) moveChat(key string) tea.Cmd {
+func (m *ui) moveChat(key string) {
 	next := moveIndex(key, m.chatIndex, len(m.chats), m.layout().bodyHeight)
-	if next == m.chatIndex {
-		return nil
+	if next != m.chatIndex {
+		m.chatIndex, m.focus = next, uiChats
 	}
-	m.chatIndex = next
-	return m.resetHistory()
 }
 
 func (m *ui) moveHistory(key string) {
@@ -1298,7 +1303,7 @@ func (m *ui) setHistory(messages []message, follow bool) {
 	m.historySearch = m.historySearch[:0]
 	selected := -1
 	now := time.Now()
-	isGroup := len(m.chats) > 0 && m.chats[m.chatIndex].IsGroup
+	isGroup := m.historyChat.IsGroup
 	var prev time.Time
 	var prevSender string
 	byGUID := make(map[string]*message, len(messages))
@@ -1573,8 +1578,7 @@ func (m *ui) mainView() string {
 		return m.historyLine(row)
 	}
 	title := "History"
-	if len(m.chats) > 0 {
-		c := m.chats[m.chatIndex]
+	if c := m.historyChat; c.ID != 0 {
 		title = chatName(c)
 		if c.Unread && m.sidebarWidth() == 0 {
 			title = "• " + title
@@ -1661,7 +1665,7 @@ func (m *ui) chatLine(row int) string {
 
 func (m *ui) historyLine(row int) string {
 	width := m.historyWidth()
-	if m.historyLimit > 0 && len(m.rows) == 0 && len(m.chats) > 0 && row == 0 {
+	if m.historyLimit > 0 && len(m.rows) == 0 && row == 0 {
 		if m.historyBusy {
 			return ""
 		}
@@ -1726,7 +1730,7 @@ func (m *ui) layout() paneLayout {
 }
 
 func (m *ui) hasComposer() bool {
-	return len(m.chats) > 0 && m.focus != uiHidden && (m.sidebarWidth() > 0 || m.focus != uiChats)
+	return m.historyChat.ID != 0 && m.focus != uiHidden && (m.sidebarWidth() > 0 || m.focus != uiChats)
 }
 
 func (m *ui) footer() string {
@@ -1773,7 +1777,7 @@ func (m *ui) footerKeys() string {
 			keys += "  Enter Play"
 		case link != "":
 			keys += "  Enter Link"
-		case m.atLatestMessage() && m.chats[m.chatIndex].Unread && m.rows[m.rowIndex].attachmentIndex < 0:
+		case m.atLatestMessage() && m.historyChat.Unread && m.rows[m.rowIndex].attachmentIndex < 0:
 			keys += "  Enter Read"
 		}
 		if m.moreHistory {
@@ -1814,7 +1818,7 @@ func (m *ui) composerLines(height int) []string {
 		inner -= 4 // reserve the two sides of the box and their padding
 	}
 	prefix, context := "> ", ""
-	key := draftKey{chatID: m.chats[m.chatIndex].ID}
+	key := draftKey{chatID: m.historyChat.ID}
 	if m.focus == uiCompose {
 		key = m.composeDraft
 	}
@@ -1917,7 +1921,7 @@ func (m *ui) pendingStatus() string {
 		return "Working…"
 	case m.chatsBusy && len(m.chats) == 0:
 		return "Loading chats…"
-	case m.historyBusy && len(m.rows) == 0:
+	case m.historyBusy && m.historyChat.ID != 0 && len(m.rows) == 0:
 		return "Loading messages…"
 	case m.reconnecting:
 		return "Reconnecting…"

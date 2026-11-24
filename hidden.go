@@ -33,9 +33,9 @@ func (m *ui) toggleHidden(c chat) {
 	}
 	m.actionErr = nil
 	if restore && chatIndex(m.latestChats, c.ID) < 0 {
-		if m.openedChat != nil && m.openedChat.ID == c.ID {
-			c.Unread = m.openedChat.Unread
-			*m.openedChat = c
+		if m.directoryChat != nil && m.directoryChat.ID == c.ID {
+			c.Unread = m.directoryChat.Unread
+			*m.directoryChat = c
 			c.Unread = false
 		}
 		if i := chatIndex(m.restoredChats, c.ID); i >= 0 {
@@ -45,9 +45,7 @@ func (m *ui) toggleHidden(c chat) {
 		}
 	}
 	m.hiddenIndex = min(m.hiddenIndex, max(0, len(m.hidden.chats)-1))
-	if m.reselectChats() {
-		m.clearHistory()
-	}
+	m.reselectChats()
 }
 
 func (m *ui) hiddenView() string {
