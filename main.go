@@ -1566,14 +1566,21 @@ func (m *ui) mainView() string {
 			title = "• " + title
 		}
 	}
+	chatsTitle := "Chats"
+	switch m.focus {
+	case uiChats:
+		chatsTitle = "\x1b[7m" + chatsTitle + "\x1b[27m"
+	case uiHistory:
+		title = "\x1b[7m" + title + "\x1b[27m"
+	}
 	var lines []string
 	if sidebar := m.sidebarWidth(); sidebar > 0 {
-		lines = append(lines, pad("Chats", sidebar)+" │ "+ansi.Truncate(title, m.historyWidth(), ""))
+		lines = append(lines, pad(chatsTitle, sidebar)+" │ "+ansi.Truncate(title, m.historyWidth(), ""))
 		for i := range layout.bodyHeight {
 			lines = append(lines, pad(m.chatLine(i), sidebar)+" │ "+historyLine(i))
 		}
 	} else if m.focus == uiChats {
-		lines = append(lines, ansi.Truncate("Chats", m.width, ""))
+		lines = append(lines, ansi.Truncate(chatsTitle, m.width, ""))
 		for i := range layout.bodyHeight {
 			lines = append(lines, ansi.Truncate(m.chatLine(i), m.width, ""))
 		}
@@ -1822,9 +1829,14 @@ func (m *ui) composerLines(height int) []string {
 		room--
 	}
 	focused := m.focus == uiCompose || m.focus == uiEdit
+	left, right := "[", "]"
+	if focused {
+		style := "\x1b[1m" + string(m.accent)
+		left, right = style+left+"\x1b[22;39m", style+right+"\x1b[22;39m"
+	}
 	for _, line := range draft.visibleLines(prefix, inner, min(5, room), focused) {
 		if inner < width {
-			line = "[ " + pad(line, inner) + " ]"
+			line = left + " " + pad(line, inner) + " " + right
 		}
 		lines = append(lines, ansi.Truncate(line, width, ""))
 	}
