@@ -85,11 +85,13 @@ function resolveMedia(chat, guid, target, kind) {
 }
 
 function resolveTarget(chat, guid, filename) {
+    const mentionMarker = "CAST('__kIMMentionConfirmedMention' AS BLOB)";
     const rows = query(`
         SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, c.service_name AS chatService,
                m.is_from_me AS outgoing, m.service, m.thread_originator_guid AS origin,
                m.date / 1000000000 + 978307200 AS seconds, m.part_count AS parts,
                instr(m.attributedBody, CAST('__kIMCalendarEventAttributeName' AS BLOB)) > 0 AS calendarEvent,
+               instr(m.attributedBody, ${mentionMarker}) > 0 AS mention,
                m.text, hex(m.attributedBody) AS body
         FROM chat c
         JOIN chat_message_join j ON j.chat_id = c.ROWID
@@ -149,9 +151,26 @@ function resolveTarget(chat, guid, filename) {
     if (duplicates.some(row => row.outgoing === target.outgoing)) {
         throw new Error('Target text is not unique for that sender direction in this chat');
     }
-    const calendarMinute = !files.length && target.parts === 1 && target.service === 'iMessage' &&
-        target.seconds && target.calendarEvent ? clock(target.seconds) : null;
-    return { ...target, text, part, calendarMinute, ambiguousDirection: duplicates.length > 0 };
+    const descriptionMinute = !files.length && target.parts === 1 && target.service === 'iMessage' &&
+        target.seconds && (target.calendarEvent || target.mention) ? clock(target.seconds) : null;
+    let mentionMinute = null;
+    if (descriptionMinute && target.mention) {
+        // The mention label can differ from the stored name, and AX does not expose a date.
+        const prefix = sqlQuote(text.trimEnd());
+        const competitors = query(`
+            SELECT m.date / 1000000000 + 978307200 AS seconds
+            FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
+            WHERE j.chat_id = ${chat} AND m.guid COLLATE BINARY <> ${guid}
+              AND COALESCE(m.associated_message_type, 0) = 0
+              AND (m.is_from_me = ${target.outgoing} OR m.is_from_me IS NULL)
+              AND strftime('%M', m.date / 1000000000 + 978307200, 'unixepoch', 'localtime') =
+                  strftime('%M', ${target.seconds}, 'unixepoch', 'localtime')
+              AND (instr(m.attributedBody, ${mentionMarker}) > 0
+                   OR instr(m.text, ${prefix}) > 0 OR instr(m.attributedBody, CAST(${prefix} AS BLOB)) > 0)`);
+        if (!competitors.some(row => clock(row.seconds) === descriptionMinute)) mentionMinute = descriptionMinute;
+    }
+    const calendarMinute = target.calendarEvent ? descriptionMinute : null;
+    return { ...target, text, part, calendarMinute, mentionMinute, ambiguousDirection: duplicates.length > 0 };
 }
 
 function attr(element, name) {
@@ -279,16 +298,24 @@ function targetOwners(view, target) {
                 if (end < middle) return target.outgoing === 0;
                 throw new Error('Cannot distinguish the sender direction of a matching balloon');
             }).map(balloon => attr(balloon, 'AXParent'));
-        if (!target.calendarMinute) return owners;
+        if (!target.calendarMinute && !target.mentionMinute) return owners;
 
-        // Calendar links can replace the text area with a group that exposes text only in its description.
+        // Rich text can replace the text area with a group that exposes text only in its description.
         const description = value(row, 'AXDescription');
         const separator = description?.indexOf(', ') ?? -1;
         if (separator < 1) return owners;
         const sender = description.slice(0, separator);
         const body = description.slice(separator + 2);
         if ((target.outgoing ? sender !== 'Your iMessage' : sender.startsWith('Your ')) ||
-            body.startsWith('Reply Preview, ') || body !== target.text + ', ' + target.calendarMinute) return owners;
+            body.startsWith('Reply Preview, ')) return owners;
+        const calendar = target.calendarMinute && body === target.text + ', ' + target.calendarMinute;
+        const mention = target.mentionMinute && body.endsWith(', ' + target.mentionMinute) &&
+            [target.text, target.text.trimEnd()].some(text => {
+                const prefix = text + ', 1 mention, ';
+                return body.startsWith(prefix) &&
+                    /^[^,]+$/.test(body.slice(prefix.length, -target.mentionMinute.length - 2));
+            });
+        if (!calendar && !mention) return owners;
         return owners.concat(children(row).filter(el => role(el) === 'AXGroup' && identifier(el) === 'Sticker' &&
             !children(el).length && value(el, 'AXDescription') === description));
     });
