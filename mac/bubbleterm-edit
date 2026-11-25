@@ -76,9 +76,11 @@ function requireUniqueEditText(chat, guid, target) {
     }
 }
 
+const isEditButton = (el, label) => role(el) === 'AXButton' &&
+    (value(el, 'AXDescription') === label || value(el, 'AXTitle') === label);
+
 function editButtons(root, label) {
-    return find(root, el => role(el) === 'AXButton' &&
-        (value(el, 'AXDescription') === label || value(el, 'AXTitle') === label),
+    return find(root, el => isEditButton(el, label),
         el => ['ConversationList', 'MessageEntryView'].includes(identifier(el)));
 }
 
@@ -91,42 +93,44 @@ function editOrigin(context, target) {
         throw new Error('Close any open edit or reply in Messages first');
     }
     const view = views[0];
-    const matches = targetBalloons(view, target);
-    if (matches.length !== 1) throw new Error('Cannot verify the target message balloon');
-    const owner = attr(matches[0], 'AXParent');
-    const row = owner && attr(owner, 'AXParent');
+    const owners = targetOwners(view, target);
+    if (owners.length !== 1 || !owners[0]) throw new Error('Cannot verify the target message balloon');
+    const row = attr(owners[0], 'AXParent');
     const description = row && value(row, 'AXDescription');
     const rows = children(view);
     const index = row ? rows.findIndex(el => $.CFEqual(el, row)) : -1;
     if (index < 0 || !description || !description.startsWith('Your iMessage, ') || !description.endsWith(', ' + target.time)) {
         throw new Error('Cannot verify the outgoing balloon and its clock time');
     }
-    return { ...context, view, rows, index };
+    return { ...context, view, rows, index, description, pane: attr(view, 'AXParent') };
 }
 
 function editComposer(context) {
     const window = context.focusedWindow();
     if (!window || !$.CFEqual(window, context.window)) return null;
     const views = find(window, el => identifier(el) === transcriptID);
-    if (views.length !== 1 || !$.CFEqual(views[0], context.view)) return null;
-    const rows = children(views[0]);
+    if (views.length !== 1 || !$.CFEqual(views[0], context.view) || value(views[0], 'AXDescription') !== 'Messages') return null;
+    const view = views[0];
+    const pane = attr(view, 'AXParent');
+    if (!pane || !context.pane || !$.CFEqual(pane, context.pane)) return null;
+
+    // Messages leaves an empty row with the original description and puts the editor beside the transcript.
+    const rows = children(view);
+    const row = rows[context.index];
+    if (!row || value(row, 'AXDescription') !== context.description || children(row).length ||
+        !visibleRows(view).some(el => $.CFEqual(el, row))) return null;
+    if (!$.CFEqual(row, context.rows[context.index]) && (rows.length !== context.rows.length ||
+        context.rows.some((el, i) => i !== context.index && !$.CFEqual(el, rows[i])))) return null;
+
     const field = attr(context.app, 'AXFocusedUIElement');
     if (!field || !['AXTextArea', 'AXTextField'].includes(role(field)) ||
         identifier(field) === 'messageBodyField' || !value(field, 'AXEnabled')) return null;
-    let row = field;
-    for (;;) {
-        const parent = attr(row, 'AXParent');
-        if (!parent || $.CFEqual(parent, window)) return null;
-        if ($.CFEqual(parent, views[0])) break;
-        row = parent;
-    }
-    // The native editor can replace its balloon row. Require the same slot and unchanged neighbors.
-    if (!$.CFEqual(row, context.rows[context.index]) && (rows.length !== context.rows.length ||
-        !$.CFEqual(row, rows[context.index]) || context.rows.some((el, i) => i !== context.index && !$.CFEqual(el, rows[i])))) {
-        return null;
-    }
-    const submit = editButtons(row, 'Send edit');
-    const cancel = editButtons(row, 'Cancel edit');
+    const owner = attr(field, 'AXParent');
+    const controls = children(pane);
+    if (!owner || role(owner) !== 'AXGroup' || identifier(owner) !== 'Sticker' ||
+        !controls.some(el => $.CFEqual(el, owner))) return null;
+    const submit = controls.filter(el => isEditButton(el, 'Send edit'));
+    const cancel = controls.filter(el => isEditButton(el, 'Cancel edit'));
     if (submit.length !== 1 || cancel.length !== 1 || !hasAction(submit[0], 'AXPress')) return null;
     return { field, submit: submit[0] };
 }
