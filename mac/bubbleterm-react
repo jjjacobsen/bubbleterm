@@ -65,13 +65,12 @@ function clock(seconds) {
     return ObjC.unwrap($.NSDateFormatter.localizedStringFromDateDateStyleTimeStyle(messageDate(seconds), 0, 1));
 }
 
-function resolveMedia(chat, guid, target, kind, allowTimeDisambiguation) {
+function resolveMedia(chat, guid, target, kind, caption, allowTimeDisambiguation) {
     if (target.service !== 'iMessage' || !target.seconds) throw new Error('No usable media timestamp or sender direction');
     const minute = clock(target.seconds);
-    // A media row has only a clock time, not the date, file name, or GUID. Search all dates in the chat.
-    // Hidden link preview payloads are not photo or video balloons.
+    // AX does not expose the attachment path or date. Check for collisions across the entire chat.
     const competitors = query(`
-        SELECT DISTINCT m.date / 1000000000 + 978307200 AS seconds, a.mime_type AS mime
+        SELECT DISTINCT CAST(m.ROWID AS TEXT) AS id, m.date / 1000000000 + 978307200 AS seconds, a.mime_type AS mime
         FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
         JOIN message_attachment_join ma ON ma.message_id = m.ROWID
         JOIN attachment a ON a.ROWID = ma.attachment_id
@@ -83,19 +82,55 @@ function resolveMedia(chat, guid, target, kind, allowTimeDisambiguation) {
           AND strftime('%M', m.date / 1000000000 + 978307200, 'unixepoch', 'localtime') =
               strftime('%M', ${target.seconds}, 'unixepoch', 'localtime')`)
         .filter(row => (!mediaKind(row.mime) || mediaKind(row.mime) === kind) && clock(row.seconds) === minute);
-    const requireTodaySeparator = competitors.length > 0;
-    if (requireTodaySeparator) {
-        const calendar = $.NSCalendar.currentCalendar;
-        if (!allowTimeDisambiguation || !calendar.isDateInToday(messageDate(target.seconds)) ||
-            competitors.some(row => calendar.isDateInToday(messageDate(row.seconds)))) {
-            throw new Error('Media type and clock time do not identify a unique balloon in this chat');
-        }
+    let anchors = [];
+    if (competitors.length) {
+        if (allowTimeDisambiguation) anchors = mediaAnchors(chat, target, caption, competitors);
+        if (!anchors.length) throw new Error('Media type and clock time match other balloons, and no unique adjacent text can identify the target');
     }
-    return { ...target, kind, minute, requireTodaySeparator, part: 0 };
+    return { ...target, kind, minute, anchors, part: 0 };
 }
 
-function uniqueTextMinute(chat, guid, target, text) {
-    const minute = clock(target.seconds);
+function mediaAnchors(chat, target, caption, competitors) {
+    const neighbor = (op, order) => query(`
+        SELECT CAST(m.ROWID AS TEXT) AS id, m.guid, m.is_from_me AS outgoing, m.text,
+               m.date / 1000000000 + 978307200 AS seconds, m.part_count AS parts,
+               hex(m.attributedBody) AS body, count(a.ROWID) AS files, min(a.mime_type) AS mime,
+               m.service IS 'iMessage' AND m.thread_originator_guid IS NULL AND m.balloon_bundle_id IS NULL
+                   AND COALESCE(m.associated_message_type, 0) = 0 AND COALESCE(m.is_system_message, 0) = 0
+                   AND COALESCE(m.item_type, 0) = 0 AND COALESCE(m.date_edited, 0) = 0
+                   AND COALESCE(m.date_retracted, 0) = 0 AND NOT max(a.hide_attachment IS 1 OR a.is_sticker IS 1)
+                   AS eligible
+        FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
+        LEFT JOIN message_attachment_join ma ON ma.message_id = m.ROWID
+        LEFT JOIN attachment a ON a.ROWID = ma.attachment_id
+        WHERE j.chat_id = ${chat} AND (m.date, m.ROWID) ${op} (${target.date}, ${target.id})
+          AND COALESCE(m.associated_message_type, 0) NOT BETWEEN 2000 AND 2007
+          AND COALESCE(m.associated_message_type, 0) NOT BETWEEN 3000 AND 3007
+        GROUP BY m.ROWID ORDER BY m.date ${order}, m.ROWID ${order} LIMIT 1`)[0];
+    const before = neighbor('<', 'DESC');
+    const after = neighbor('>', 'ASC');
+    const anchors = [];
+    const add = (step, row, text, sameMessage = false) => {
+        if (!text?.trim() || /[\x00\ufffc\ufffd]/.test(text) || !row.seconds || ![0, 1].includes(row.outgoing)) return;
+        const minute = clock(row.seconds);
+        if (textMinuteIsUnique(chat, sqlQuote(row.guid), text, minute)) {
+            anchors.push({ step, text, minute, outgoing: row.outgoing, sameMessage });
+        }
+    };
+    // Do not distinguish consecutive lookalike media using just an anchor on the outside of the run.
+    if (before?.eligible && (caption || !competitors.some(row => row.id === after?.id))) {
+        if (!before.files && before.parts === 1) add(-1, before, before.text);
+        if (before.files === 1 && before.parts === 2 && mediaKind(before.mime) && before.text &&
+            messageText({ ...before, text: null }) === '\ufffc' + before.text) add(-1, before, before.text);
+    }
+    if (!competitors.some(row => row.id === before?.id)) {
+        if (caption) add(1, target, caption, true);
+        else if (after?.eligible && !after.files && after.parts === 1) add(1, after, after.text);
+    }
+    return anchors;
+}
+
+function textMinuteIsUnique(chat, guid, text, minute) {
     const needle = sqlQuote(text);
     // AX has no date. Check all dates and directions, including captions and edits.
     const competitors = query(`
@@ -105,16 +140,14 @@ function uniqueTextMinute(chat, guid, target, text) {
           AND COALESCE(m.associated_message_type, 0) = 0
           AND (COALESCE(m.date_edited, 0) <> 0 OR instr(m.text, ${needle}) > 0
                OR instr(m.attributedBody, CAST(${needle} AS BLOB)) > 0)`);
-    if (competitors.some(row => !row.seconds || clock(row.seconds) === minute)) {
-        throw new Error('Target text and clock time do not identify a unique balloon in this chat');
-    }
-    return minute;
+    return !competitors.some(row => !row.seconds || clock(row.seconds) === minute);
 }
 
 function resolveTarget(chat, guid, filename, allowTimeDisambiguation = false) {
     const mentionMarker = "CAST('__kIMMentionConfirmedMention' AS BLOB)";
     const rows = query(`
         SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, c.service_name AS chatService,
+               CAST(m.ROWID AS TEXT) AS id, CAST(m.date AS TEXT) AS date, m.guid,
                m.is_from_me AS outgoing, m.service, m.thread_originator_guid AS origin,
                m.date / 1000000000 + 978307200 AS seconds, m.part_count AS parts,
                instr(m.attributedBody, CAST('__kIMCalendarEventAttributeName' AS BLOB)) > 0 AS calendarEvent,
@@ -156,7 +189,7 @@ function resolveTarget(chat, guid, filename, allowTimeDisambiguation = false) {
         if (!body.startsWith('\ufffc') || caption.includes('\ufffc') || target.parts !== (caption ? 2 : 1)) {
             throw new Error('Cannot identify the attachment and caption parts');
         }
-        if (filename !== undefined || !caption) return resolveMedia(chat, guid, target, mediaKind(file.mime), allowTimeDisambiguation);
+        if (filename !== undefined || !caption) return resolveMedia(chat, guid, target, mediaKind(file.mime), caption, allowTimeDisambiguation);
         text = caption;
         part = 1;
     } else {
@@ -181,7 +214,10 @@ function resolveTarget(chat, guid, filename, allowTimeDisambiguation = false) {
             !(target.seconds > 978307200) || target.calendarEvent || target.mention) {
             throw new Error('Target text is not unique for that sender direction in this chat');
         }
-        textMinute = uniqueTextMinute(chat, guid, target, text);
+        textMinute = clock(target.seconds);
+        if (!textMinuteIsUnique(chat, guid, text, textMinute)) {
+            throw new Error('Target text and clock time do not identify a unique balloon in this chat');
+        }
     }
     const descriptionMinute = !files.length && target.parts === 1 && target.service === 'iMessage' &&
         target.seconds && (target.calendarEvent || target.mention) ? clock(target.seconds) : null;
@@ -293,46 +329,75 @@ function withMenuItem(app, window, parent, requireTarget, itemID, useItem) {
     }
 }
 
-function horizontalBounds(element) {
+function bounds(element) {
     const frame = attr(element, 'AXFrame');
-    const match = frame && /value = x:(-?[\d.]+) y:-?[\d.]+ w:([\d.]+) h:/.exec(ObjC.unwrap(frame.description));
+    const match = frame && /value = x:(-?[\d.]+) y:(-?[\d.]+) w:([\d.]+) h:([\d.]+)/.exec(ObjC.unwrap(frame.description));
     if (!match) throw new Error('Cannot read the Messages balloon position');
-    return [Number(match[1]), Number(match[1]) + Number(match[2])];
+    return match.slice(1).map(Number);
+}
+
+function mediaCenterVisible(view, owner) {
+    const [, top, , height] = bounds(view);
+    const [, y, , h] = bounds(owner);
+    return y + h / 2 > top && y + h / 2 < top + height;
 }
 
 const visibleRows = view => value(view, 'AXVisibleChildren') || children(view);
 
-function isTodaySeparator(row, minute) {
-    if (role(row) !== 'AXGroup' || identifier(row) !== null || value(row, 'AXDescription') !== null) return false;
-    const [label, extra] = children(row);
-    return label && !extra && role(label) === 'AXStaticText' && identifier(label) === null &&
-        value(label, 'AXDescription') === 'Today ' + minute;
+function transcriptMarker(row) {
+    if (identifier(row) !== null || value(row, 'AXDescription') !== null) return false;
+    const parts = children(row);
+    // Tapback badges are separate anonymous static rows. Date and status labels are not balloons either.
+    if (role(row) === 'AXStaticText') return !parts.length && value(row, 'AXValue') === null;
+    const [label] = parts;
+    return role(row) === 'AXGroup' && parts.length === 1 && role(label) === 'AXStaticText' && identifier(label) === null &&
+        /^(Delivered|Read(?: .+)?|(?:Today|Yesterday) .+)$/.test(value(label, 'AXDescription'));
+}
+
+function matchingSender(sender, outgoing) {
+    return !!sender && (outgoing ? sender === 'Your iMessage' : !sender.startsWith('Your '));
+}
+
+function mediaOwners(view, visible, target) {
+    if (target.anchors.length && value(view, 'AXDescription') !== 'Messages') return [];
+    const rows = target.anchors.length ? children(view).filter(row => !transcriptMarker(row)) : [];
+    const anchors = target.anchors.flatMap(anchor => {
+        const matches = rows.flatMap((row, index) => {
+            const description = value(row, 'AXDescription');
+            if (!description?.endsWith(', ' + anchor.minute)) return [];
+            const sender = description.split(', ')[0];
+            if (!matchingSender(sender, anchor.outgoing) || !description.startsWith(sender + ', ' + anchor.text + ', ')) return [];
+            const owners = children(row).filter(owner => role(owner) === 'AXGroup' && identifier(owner) === 'Sticker' &&
+                value(owner, 'AXDescription') === description);
+            if (owners.length !== 1) return [];
+            const parts = children(owners[0]);
+            // Rich text can expose the exact text in the owner's description instead of a text area.
+            const exact = description === sender + ', ' + anchor.text + ', ' + anchor.minute;
+            return ((!parts.length && exact) || parts.some(balloon => identifier(balloon) === 'CKBalloonTextView' &&
+                value(balloon, 'AXValue') === anchor.text)) ? [{ index, sender }] : [];
+        });
+        return matches.length === 1 ? [{ ...anchor, ...matches[0] }] : [];
+    });
+    return visible.flatMap(row => {
+        const description = value(row, 'AXDescription');
+        if (!description?.endsWith(', ' + target.minute)) return [];
+        const [sender, label] = description.split(', ');
+        if (label !== 'Includes ' + target.kind || !matchingSender(sender, target.outgoing)) return [];
+        if (target.anchors.length && (!anchors.length || !anchors.every(anchor => {
+            const neighbor = rows[anchor.index - anchor.step];
+            return neighbor && $.CFEqual(neighbor, row) && (!anchor.sameMessage || anchor.sender === sender);
+        }))) return [];
+        const buttons = children(row).filter(el => role(el) === 'AXButton' && identifier(el) === 'Sticker');
+        if (buttons.length !== 1 || value(buttons[0], 'AXDescription') !== description) {
+            throw new Error('Cannot isolate the media button in the matching row');
+        }
+        return buttons;
+    });
 }
 
 function targetOwners(view, target) {
     const visible = visibleRows(view);
-    if (target.kind) {
-        const rows = target.requireTodaySeparator ? children(view) : null;
-        if (rows && (value(view, 'AXDescription') !== 'Messages' ||
-            !$.NSCalendar.currentCalendar.isDateInToday(messageDate(target.seconds)))) return [];
-        return visible.flatMap(row => {
-            const description = value(row, 'AXDescription');
-            if (!description || !description.endsWith(', ' + target.minute)) return [];
-            const [sender, label] = description.split(', ');
-            if (label !== 'Includes ' + target.kind || !sender ||
-                (target.outgoing ? sender !== 'Your iMessage' : sender.startsWith('Your '))) return [];
-            if (rows) {
-                // Use only the immediately preceding date separator at the same clock minute.
-                const index = rows.findIndex(el => $.CFEqual(el, row));
-                if (index < 1 || !isTodaySeparator(rows[index - 1], target.minute)) return [];
-            }
-            const buttons = children(row).filter(el => role(el) === 'AXButton' && identifier(el) === 'Sticker');
-            if (buttons.length !== 1 || value(buttons[0], 'AXDescription') !== description) {
-                throw new Error('Cannot isolate the media button in the matching row');
-            }
-            return buttons;
-        });
-    }
+    if (target.kind) return mediaOwners(view, visible, target);
     if (target.textMinute) {
         if (value(view, 'AXDescription') !== 'Messages') return [];
         return visible.flatMap(row => {
@@ -351,11 +416,11 @@ function targetOwners(view, target) {
             .filter(balloon => {
                 if (!target.ambiguousDirection) return true;
                 // Self chats can display a sent and a received copy of the same text.
-                const [left, right] = horizontalBounds(view);
-                const [start, end] = horizontalBounds(balloon);
-                const middle = (left + right) / 2;
+                const [left, , width] = bounds(view);
+                const [start, , size] = bounds(balloon);
+                const middle = left + width / 2;
                 if (start > middle) return target.outgoing === 1;
-                if (end < middle) return target.outgoing === 0;
+                if (start + size < middle) return target.outgoing === 0;
                 throw new Error('Cannot distinguish the sender direction of a matching balloon');
             }).map(balloon => attr(balloon, 'AXParent'));
         if (!target.calendarMinute && !target.mentionMinute) return owners;
@@ -509,13 +574,26 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
     // Opening a chat can leave it scrolled back. Check newer pages, then retrace them to search older pages.
     const newerPages = search('AXScrollDownByPage', 10);
     search('AXScrollUpByPage', newerPages + 3);
-    if (!owner) throw new Error('Target balloon not found. Scroll to it in Messages and retry');
+    if (!owner) {
+        if (target.anchors?.length) throw new Error('Cannot match the media to adjacent text. Scroll to show both in Messages and retry');
+        throw new Error('Target balloon not found. Scroll to it in Messages and retry');
+    }
 
     const window = focusedWindow();
     if (!window || !$.CFEqual(window, current.window) || !owner || !hasAction(owner, 'AXShowMenu')) {
         throw new Error('Cannot open the exact target balloon menu');
     }
     if (mode === '--dry-run') return 'Target balloon found. No changes made in Messages.';
+    if (target.kind && !mediaCenterVisible(current.view, owner)) {
+        // Page scrolling can expose a sliver of a balloon without bringing its menu anchor into view.
+        const status = $.AXUIElementPerformAction(owner, 'AXScrollToVisible');
+        owner = status === 0 && waitFor(() => {
+            current = requireTranscript();
+            const found = locate();
+            return found && mediaCenterVisible(current.view, found) && found;
+        }, 2);
+        if (!owner || !hasAction(owner, 'AXShowMenu')) throw new Error('Cannot bring the verified media balloon into view');
+    }
     return withMenuItem(app, window, owner, () => {
         const found = targetOwners(requireTranscript().view, target);
         if (found.length !== 1 || !$.CFEqual(found[0], owner)) throw new Error('The target balloon changed');
