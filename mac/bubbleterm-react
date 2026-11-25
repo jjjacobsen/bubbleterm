@@ -219,10 +219,12 @@ function resolveTarget(chat, guid, filename, allowTimeDisambiguation = false) {
             throw new Error('Target text and clock time do not identify a unique balloon in this chat');
         }
     }
-    const descriptionMinute = !files.length && target.parts === 1 && target.service === 'iMessage' &&
-        target.seconds && (target.calendarEvent || target.mention) ? clock(target.seconds) : null;
+    // A verified caption is the final part after the attachment and can have its own rich text balloon.
+    const standaloneMention = !files.length && target.mention;
+    const descriptionMinute = target.parts === part + 1 && target.service === 'iMessage' &&
+        target.seconds && (target.calendarEvent || standaloneMention) ? clock(target.seconds) : null;
     let mentionMinute = null;
-    if (descriptionMinute && target.mention) {
+    if (descriptionMinute && standaloneMention) {
         // The mention label can differ from the stored name, and AX does not expose a date.
         const prefix = sqlQuote(text.trimEnd());
         const competitors = query(`
@@ -237,7 +239,8 @@ function resolveTarget(chat, guid, filename, allowTimeDisambiguation = false) {
                    OR instr(m.text, ${prefix}) > 0 OR instr(m.attributedBody, CAST(${prefix} AS BLOB)) > 0)`);
         if (!competitors.some(row => clock(row.seconds) === descriptionMinute)) mentionMinute = descriptionMinute;
     }
-    const calendarMinute = target.calendarEvent ? descriptionMinute : null;
+    const calendarMinute = target.calendarEvent && descriptionMinute &&
+        (part === 0 || textMinuteIsUnique(chat, guid, text, descriptionMinute)) ? descriptionMinute : null;
     return { ...target, text, part, textMinute, calendarMinute, mentionMinute, ambiguousDirection: duplicates.length > 0 };
 }
 
