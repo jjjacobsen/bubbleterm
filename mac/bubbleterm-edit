@@ -140,7 +140,7 @@ function openEdit(target, requireOriginal) {
     for (const itemID of ['edit', 'edit…']) {
         let choseItem = false;
         try {
-            return withTargetMenu(target, itemID, '--check', (item, context) => {
+            return withTargetMenu(target, itemID, '--selected', (item, context) => {
                 requireOriginal();
                 const editorContext = editOrigin(context, target);
                 if (!['Edit', 'Edit…'].includes(value(item, 'AXTitle'))) throw new Error('Cannot verify the Edit menu item');

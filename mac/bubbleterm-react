@@ -59,15 +59,16 @@ function mediaKind(mime) {
     return null;
 }
 
+const messageDate = seconds => $.NSDate.dateWithTimeIntervalSince1970(seconds);
+
 function clock(seconds) {
-    const date = $.NSDate.dateWithTimeIntervalSince1970(seconds);
-    return ObjC.unwrap($.NSDateFormatter.localizedStringFromDateDateStyleTimeStyle(date, 0, 1));
+    return ObjC.unwrap($.NSDateFormatter.localizedStringFromDateDateStyleTimeStyle(messageDate(seconds), 0, 1));
 }
 
-function resolveMedia(chat, guid, target, kind) {
+function resolveMedia(chat, guid, target, kind, allowTimeDisambiguation) {
     if (target.service !== 'iMessage' || !target.seconds) throw new Error('No usable media timestamp or sender direction');
     const minute = clock(target.seconds);
-    // AX exposes only a clock time, not the date, file name, or GUID. Search all dates in the chat.
+    // A media row has only a clock time, not the date, file name, or GUID. Search all dates in the chat.
     // Hidden link preview payloads are not photo or video balloons.
     const competitors = query(`
         SELECT DISTINCT m.date / 1000000000 + 978307200 AS seconds, a.mime_type AS mime
@@ -80,11 +81,17 @@ function resolveMedia(chat, guid, target, kind) {
           AND NOT (m.balloon_bundle_id IS 'com.apple.messages.URLBalloonProvider' AND a.hide_attachment IS 1
                    AND a.mime_type IS NULL AND coalesce(a.filename, '') GLOB '*.pluginPayloadAttachment')
           AND strftime('%M', m.date / 1000000000 + 978307200, 'unixepoch', 'localtime') =
-              strftime('%M', ${target.seconds}, 'unixepoch', 'localtime')`);
-    if (competitors.some(row => (!mediaKind(row.mime) || mediaKind(row.mime) === kind) && clock(row.seconds) === minute)) {
-        throw new Error('Media type and clock time do not identify a unique balloon in this chat');
+              strftime('%M', ${target.seconds}, 'unixepoch', 'localtime')`)
+        .filter(row => (!mediaKind(row.mime) || mediaKind(row.mime) === kind) && clock(row.seconds) === minute);
+    const requireTodaySeparator = competitors.length > 0;
+    if (requireTodaySeparator) {
+        const calendar = $.NSCalendar.currentCalendar;
+        if (!allowTimeDisambiguation || !calendar.isDateInToday(messageDate(target.seconds)) ||
+            competitors.some(row => calendar.isDateInToday(messageDate(row.seconds)))) {
+            throw new Error('Media type and clock time do not identify a unique balloon in this chat');
+        }
     }
-    return { ...target, kind, minute, part: 0 };
+    return { ...target, kind, minute, requireTodaySeparator, part: 0 };
 }
 
 function uniqueTextMinute(chat, guid, target, text) {
@@ -104,7 +111,7 @@ function uniqueTextMinute(chat, guid, target, text) {
     return minute;
 }
 
-function resolveTarget(chat, guid, filename, allowTextMinute = false) {
+function resolveTarget(chat, guid, filename, allowTimeDisambiguation = false) {
     const mentionMarker = "CAST('__kIMMentionConfirmedMention' AS BLOB)";
     const rows = query(`
         SELECT c.guid AS chatGUID, c.chat_identifier AS identifier, c.service_name AS chatService,
@@ -149,7 +156,7 @@ function resolveTarget(chat, guid, filename, allowTextMinute = false) {
         if (!body.startsWith('\ufffc') || caption.includes('\ufffc') || target.parts !== (caption ? 2 : 1)) {
             throw new Error('Cannot identify the attachment and caption parts');
         }
-        if (filename !== undefined || !caption) return resolveMedia(chat, guid, target, mediaKind(file.mime));
+        if (filename !== undefined || !caption) return resolveMedia(chat, guid, target, mediaKind(file.mime), allowTimeDisambiguation);
         text = caption;
         part = 1;
     } else {
@@ -170,7 +177,7 @@ function resolveTarget(chat, guid, filename, allowTextMinute = false) {
         .filter(row => row.text === text || messageText({ ...row, text: null }).split('\ufffc').includes(text));
     let textMinute = null;
     if (duplicates.some(row => row.outgoing === target.outgoing)) {
-        if (!allowTextMinute || files.length || target.parts !== 1 || target.service !== 'iMessage' ||
+        if (!allowTimeDisambiguation || files.length || target.parts !== 1 || target.service !== 'iMessage' ||
             !(target.seconds > 978307200) || target.calendarEvent || target.mention) {
             throw new Error('Target text is not unique for that sender direction in this chat');
         }
@@ -295,15 +302,30 @@ function horizontalBounds(element) {
 
 const visibleRows = view => value(view, 'AXVisibleChildren') || children(view);
 
+function isTodaySeparator(row, minute) {
+    if (role(row) !== 'AXGroup' || identifier(row) !== null || value(row, 'AXDescription') !== null) return false;
+    const [label, extra] = children(row);
+    return label && !extra && role(label) === 'AXStaticText' && identifier(label) === null &&
+        value(label, 'AXDescription') === 'Today ' + minute;
+}
+
 function targetOwners(view, target) {
     const visible = visibleRows(view);
     if (target.kind) {
+        const rows = target.requireTodaySeparator ? children(view) : null;
+        if (rows && (value(view, 'AXDescription') !== 'Messages' ||
+            !$.NSCalendar.currentCalendar.isDateInToday(messageDate(target.seconds)))) return [];
         return visible.flatMap(row => {
             const description = value(row, 'AXDescription');
             if (!description || !description.endsWith(', ' + target.minute)) return [];
             const [sender, label] = description.split(', ');
             if (label !== 'Includes ' + target.kind || !sender ||
                 (target.outgoing ? sender !== 'Your iMessage' : sender.startsWith('Your '))) return [];
+            if (rows) {
+                // Use only the immediately preceding date separator at the same clock minute.
+                const index = rows.findIndex(el => $.CFEqual(el, row));
+                if (index < 1 || !isTodaySeparator(rows[index - 1], target.minute)) return [];
+            }
             const buttons = children(row).filter(el => role(el) === 'AXButton' && identifier(el) === 'Sticker');
             if (buttons.length !== 1 || value(buttons[0], 'AXDescription') !== description) {
                 throw new Error('Cannot isolate the media button in the matching row');
@@ -359,6 +381,49 @@ function targetOwners(view, target) {
     });
 }
 
+function nativeEditControls(view) {
+    const pane = attr(view, 'AXParent');
+    const controls = children(pane);
+    const buttons = label => controls.filter(el => role(el) === 'AXButton' && value(el, 'AXDescription') === label);
+    return { pane, controls, cancel: buttons('Cancel edit'), send: buttons('Send edit') };
+}
+
+function closeBlockingEdit(current, requireTranscript, mode) {
+    const edit = nativeEditControls(current.view);
+    if (!edit.cancel.length && !edit.send.length) return current;
+    if (mode === '--check') throw new Error('Close the open edit in Messages before checking a message menu');
+
+    const verified = view => {
+        const state = nativeEditControls(view);
+        const editors = state.controls.filter(el => role(el) === 'AXGroup' && identifier(el) === 'Sticker' &&
+            children(el).some(field => ['AXTextArea', 'AXTextField'].includes(role(field)) &&
+                identifier(field) !== 'messageBodyField'));
+        const [cancel] = state.cancel;
+        if (value(view, 'AXDescription') !== 'Messages' || state.cancel.length !== 1 || state.send.length !== 1 ||
+            editors.length !== 1 || !value(cancel, 'AXEnabled') || !hasAction(cancel, 'AXPress')) {
+            throw new Error('Cannot verify the native Messages Cancel edit button');
+        }
+        return { pane: state.pane, cancel, editor: editors[0] };
+    };
+    const before = verified(current.view);
+    const latest = requireTranscript();
+    const ready = verified(latest.view);
+    if (!$.CFEqual(latest.view, current.view) || !$.CFEqual(ready.pane, before.pane) ||
+        !$.CFEqual(ready.cancel, before.cancel) || !$.CFEqual(ready.editor, before.editor)) {
+        throw new Error('The open Messages edit changed before cancellation');
+    }
+    // Press only the native Cancel edit button. Do not send a key or touch the message composer.
+    const status = $.AXUIElementPerformAction(ready.cancel, 'AXPress');
+    const closed = waitFor(() => {
+        const next = requireTranscript();
+        const state = nativeEditControls(next.view);
+        return value(next.view, 'AXDescription') === 'Messages' && !state.cancel.length && !state.send.length &&
+            !state.controls.some(el => $.CFEqual(el, ready.editor)) && next;
+    }, 3);
+    if (!closed) throw new Error('Cannot confirm the Messages edit closed (AX result ' + status + ')');
+    return closed;
+}
+
 function withTargetMenu(target, itemID, mode, useItem, prepare) {
     if (!$.AXIsProcessTrusted()) throw new Error('Grant Accessibility access to the process that runs this helper');
     // Messages uses different prefixes for regular and pinned sidebar rows.
@@ -367,17 +432,18 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
             ' CKLastSelectedItemIdentifier 2>/dev/null || true');
         return row === 'list-' + target.chatGUID || row === 'pinned-' + target.chatGUID;
     };
-    // Opening a chat can mark messages as read.
-    if (mode && !selected()) throw new Error('Select the target chat in Messages before running ' + mode);
-    if (!mode) {
+    const activeApp = () => {
+        const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(bundle);
+        return Number(apps.count) === 1 && apps.firstObject.isActive && apps.firstObject;
+    };
+    // Opening a chat can mark messages as read. Leave an already active target chat in place.
+    if (mode && !selected()) throw new Error('Select the target chat in Messages first');
+    if (!mode && !(activeApp() && selected())) {
         const url = 'sms://open?groupid=' + encodeURIComponent(target.identifier);
         shell.doShellScript('/usr/bin/open -b ' + bundle + ' ' + shellQuote(url) + ' 2>/dev/null');
     }
 
-    const running = waitFor(() => {
-        const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(bundle);
-        return Number(apps.count) === 1 && apps.firstObject.isActive && apps.firstObject;
-    }, 5);
+    const running = waitFor(activeApp, 5);
     if (!running) throw new Error('Messages is not in front');
     const app = $.AXUIElementCreateApplication(running.processIdentifier);
     const timeoutStatus = $.AXUIElementSetMessagingTimeout(app, 1);
@@ -400,10 +466,18 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
     let current = waitFor(transcript, 3);
     if (!current) throw new Error('Cannot verify the selected Messages transcript');
     const context = { app, window: current.window, pid: running.processIdentifier, focusedWindow };
-    if (prepare) {
-        prepare(context);
-        current = transcript();
-        if (!current || !$.CFEqual(current.window, context.window)) throw new Error('Messages switched chats or windows');
+    const requireTranscript = () => {
+        const next = transcript();
+        if (!next || !$.CFEqual(next.window, context.window)) throw new Error('Messages switched chats or windows');
+        return next;
+    };
+    // An open editor can block AXShowMenu even when the balloon still advertises it.
+    if (mode !== '--dry-run') {
+        current = closeBlockingEdit(current, requireTranscript, mode);
+        if (prepare) {
+            prepare(context);
+            current = requireTranscript();
+        }
     }
     const locate = () => {
         const matches = targetOwners(current.view, target);
@@ -423,8 +497,7 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
             const frame = first && attr(first, 'AXFrame');
             if ($.AXUIElementPerformAction(el, action) !== 0) break;
             delay(0.35);
-            current = transcript();
-            if (!current || !$.CFEqual(current.window, context.window)) throw new Error('Messages switched chats or windows');
+            current = requireTranscript();
             owner = locate();
             if (owner) break;
             const next = visibleRows(current.view)[0];
@@ -442,11 +515,9 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
     if (!window || !$.CFEqual(window, current.window) || !owner || !hasAction(owner, 'AXShowMenu')) {
         throw new Error('Cannot open the exact target balloon menu');
     }
-    if (mode === '--dry-run') return 'Tapback target found. No menu opened or reaction sent.';
+    if (mode === '--dry-run') return 'Target balloon found. No changes made in Messages.';
     return withMenuItem(app, window, owner, () => {
-        const focused = focusedWindow();
-        if (!focused || !$.CFEqual(focused, window)) throw new Error('Messages switched chats or windows');
-        const found = targetOwners(current.view, target);
+        const found = targetOwners(requireTranscript().view, target);
         if (found.length !== 1 || !$.CFEqual(found[0], owner)) throw new Error('The target balloon changed');
     }, itemID, item => useItem(item, context));
 }
@@ -630,6 +701,7 @@ function reply(args) {
     const target = resolveTarget(chat, origin);
     if (target.service !== 'iMessage' || target.chatService !== 'iMessage') throw new Error('Only iMessage threads are supported');
     if (target.origin || target.parts !== target.part + 1) throw new Error('Cannot isolate a replyable thread origin');
+    if (dryRun) return withTargetMenu(target, 'reply…', '--dry-run');
     const part = `${target.part}:${target.part}:${target.kind ? 1 : target.text.length}`;
 
     ObjC.import('Quartz');
@@ -638,7 +710,7 @@ function reply(args) {
     ObjC.bindFunction('AXUIElementSetAttributeValue', ['int', ['id', 'id', 'id']]);
     if (!$.CGPreflightPostEventAccess()) throw new Error('The helper cannot post a key to Messages');
 
-    const context = withTargetMenu(target, 'reply…', dryRun ? '--check' : null, (item, context) => {
+    const context = withTargetMenu(target, 'reply…', null, (item, context) => {
         const normal = composer(context, 'Messages', 'iMessage');
         if (!normal || !emptyComposer(normal)) throw new Error('Cannot verify an empty iMessage composer before opening the thread');
         if (value(item, 'AXTitle') !== 'Reply…') throw new Error('Cannot verify the Reply menu item');
@@ -653,8 +725,6 @@ function reply(args) {
     if ($.AXUIElementIsAttributeSettable(current.field, 'AXValue', settable) !== 0 || !settable[0]) {
         throw new Error('Cannot set text in the reply composer');
     }
-    if (dryRun) return 'Reply menu and exact thread composer verified. No text entered or sent.';
-
     const after = query('SELECT CAST(COALESCE(max(ROWID), 0) AS TEXT) AS id FROM message')[0].id;
     const submit = keyEvents(36);
     const empty = probe();
