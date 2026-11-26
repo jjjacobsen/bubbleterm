@@ -552,8 +552,12 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
         if (matches.length > 1) throw new Error('More than one balloon matches the target');
         return matches[0];
     };
+    const replyOpen = () => value(current.view, 'AXDescription') === 'Reply transcript';
     let owner = locate();
-    if (!owner && mode === '--dry-run') throw new Error('Target balloon is not visible in the selected chat');
+    if (!owner && mode === '--dry-run') {
+        if (replyOpen()) throw new Error('Target balloon is not visible in the open reply thread. Close it in Messages and retry');
+        throw new Error('Target balloon is not visible in the selected chat');
+    }
 
     const search = (action, limit) => {
         let pages = 0;
@@ -574,9 +578,23 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
         }
         return pages;
     };
-    // Opening a chat can leave it scrolled back. Check newer pages, then retrace them to search older pages.
-    const newerPages = search('AXScrollDownByPage', 10);
-    search('AXScrollUpByPage', newerPages + 3);
+    const searchPages = () => {
+        // Check newer pages first, then retrace them to search older pages.
+        const newerPages = search('AXScrollDownByPage', 10);
+        search('AXScrollUpByPage', newerPages + 3);
+    };
+    searchPages();
+    if (!owner && replyOpen()) {
+        // An open thread replaces the main transcript, even when the correct chat is selected.
+        dismissReply(context, composer(context, 'Reply transcript', 'Reply'));
+        current = waitFor(() => {
+            const next = requireTranscript();
+            return value(next.view, 'AXDescription') === 'Messages' && next;
+        }, 2);
+        if (!current) throw new Error('Cannot return to the main Messages transcript');
+        owner = locate();
+        searchPages();
+    }
     if (!owner) {
         if (target.anchors?.length) throw new Error('Cannot match the media to adjacent text. Scroll to show both in Messages and retry');
         throw new Error('Target balloon not found. Scroll to it in Messages and retry');
@@ -756,16 +774,25 @@ function postKey(pid, events) {
     for (const event of events) $.CGEventPostToPid(pid, event);
 }
 
+function requireKeyAccess() {
+    ObjC.import('Quartz');
+    ObjC.bindFunction('CGPreflightPostEventAccess', ['bool', []]);
+    if (!$.CGPreflightPostEventAccess()) throw new Error('The helper cannot post a key to Messages');
+}
+
+function dismissReply(context, open) {
+    const focus = attr(context.app, 'AXFocusedUIElement');
+    if (!open || !emptyComposer(open) || !focus || !$.CFEqual(focus, open.field)) {
+        throw new Error('Close the existing reply pane in Messages first');
+    }
+    requireKeyAccess();
+    postKey(context.pid, keyEvents(53)); // Escape closes the empty reply pane.
+}
+
 function prepareReply(context) {
     // Reply panes can stay open when the same conversation is opened again.
     const open = composer(context, 'Reply transcript', 'Reply');
-    if (open) {
-        const focus = attr(context.app, 'AXFocusedUIElement');
-        if (!emptyComposer(open) || !focus || !$.CFEqual(focus, open.field)) {
-            throw new Error('Close the existing reply pane in Messages first');
-        }
-        postKey(context.pid, keyEvents(53)); // Escape closes the empty reply pane.
-    }
+    if (open) dismissReply(context, open);
     const normal = waitFor(() => composer(context, 'Messages', 'iMessage'), 2);
     if (!normal || !emptyComposer(normal)) throw new Error('Cannot verify an empty iMessage composer before opening the thread');
 }
@@ -785,11 +812,9 @@ function reply(args) {
     if (dryRun) return withTargetMenu(target, 'reply…', '--dry-run');
     const part = `${target.part}:${target.part}:${target.kind ? 1 : target.text.length}`;
 
-    ObjC.import('Quartz');
-    ObjC.bindFunction('CGPreflightPostEventAccess', ['bool', []]);
+    requireKeyAccess();
     ObjC.bindFunction('AXUIElementIsAttributeSettable', ['int', ['id', 'id', 'bool*']]);
     ObjC.bindFunction('AXUIElementSetAttributeValue', ['int', ['id', 'id', 'id']]);
-    if (!$.CGPreflightPostEventAccess()) throw new Error('The helper cannot post a key to Messages');
 
     const context = withTargetMenu(target, 'reply…', null, (item, context) => {
         const normal = composer(context, 'Messages', 'iMessage');
