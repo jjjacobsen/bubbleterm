@@ -281,7 +281,7 @@ function waitFor(probe, seconds) {
     return null;
 }
 
-function withMenuItem(app, window, parent, requireTarget, itemID, useItem) {
+function withMenuItem(app, window, parent, requireTarget, itemID, useItem, showMenu) {
     const isMenu = el => role(el) === 'AXMenu';
     const menus = () => {
         const roots = [window, parent, ...children(app).filter(isMenu)];
@@ -305,9 +305,12 @@ function withMenuItem(app, window, parent, requireTarget, itemID, useItem) {
     requireTarget();
     let menu;
     try {
-        const status = $.AXUIElementPerformAction(parent, 'AXShowMenu');
-        // Showing a modal menu can time out while the menu is still open.
-        if (status !== 0 && status !== -25204) throw new Error('Cannot open the target menu (AX error ' + status + ')');
+        if (showMenu) showMenu();
+        else {
+            const status = $.AXUIElementPerformAction(parent, 'AXShowMenu');
+            // Showing a modal menu can time out while the menu is still open.
+            if (status !== 0 && status !== -25204) throw new Error('Cannot open the target menu (AX error ' + status + ')');
+        }
         const item = waitFor(() => {
             const opened = menus();
             if (opened.length > 1) throw new Error('More than one menu opened');
@@ -337,6 +340,33 @@ function bounds(element) {
     const match = frame && /value = x:(-?[\d.]+) y:(-?[\d.]+) w:([\d.]+) h:([\d.]+)/.exec(ObjC.unwrap(frame.description));
     if (!match) throw new Error('Cannot read the Messages balloon position');
     return match.slice(1).map(Number);
+}
+
+function showCalendarMenu(owner, target, mode) {
+    // A pointer event can mark a conversation as read, even when Messages is already active.
+    if (mode === '--check' && query(`
+        SELECT 1 FROM chat c JOIN chat_message_join j ON j.chat_id = c.ROWID
+        JOIN message m ON m.ROWID = j.message_id
+        WHERE c.guid COLLATE BINARY = ${sqlQuote(target.chatGUID)} AND m.is_read = 0 AND m.is_from_me = 0
+          AND m.date > c.last_read_message_timestamp LIMIT 1`).length) {
+        throw new Error('Cannot check a calendar balloon menu without marking this chat as read');
+    }
+    requireEventAccess();
+    ObjC.bindFunction('AXUIElementCreateSystemWide', ['id', []]);
+    ObjC.bindFunction('AXUIElementCopyElementAtPosition', ['int', ['id', 'float', 'float', 'id*']]);
+    const [left, top, width] = bounds(owner);
+    // AXShowMenu opens the calendar menu. Right-click the balloon's top padding instead of the date text.
+    const x = left + width / 2, y = top + 4;
+    const hit = Ref();
+    if ($.AXUIElementCopyElementAtPosition($.AXUIElementCreateSystemWide(), x, y, hit) !== 0 || !$.CFEqual(hit[0], owner)) {
+        throw new Error('Cannot verify the calendar balloon position. Scroll to show it in Messages and retry');
+    }
+    const point = $.CGPointMake(x, y);
+    for (const type of [$.kCGEventRightMouseDown, $.kCGEventRightMouseUp]) {
+        const event = $.CGEventCreateMouseEvent(null, type, point, $.kCGMouseButtonRight);
+        $.CGEventSetFlags(event, 0);
+        $.CGEventPost($.kCGSessionEventTap, event);
+    }
 }
 
 function mediaCenterVisible(view, owner) {
@@ -428,7 +458,7 @@ function targetOwners(view, target) {
             }).map(balloon => attr(balloon, 'AXParent'));
         if (!target.calendarMinute && !target.mentionMinute) return owners;
 
-        // Rich text can replace the text area with a group that exposes text only in its description.
+        // Rich text can expose a balloon only through its description.
         const description = value(row, 'AXDescription');
         const separator = description?.indexOf(', ') ?? -1;
         if (separator < 1) return owners;
@@ -444,8 +474,12 @@ function targetOwners(view, target) {
                     /^[^,]+$/.test(body.slice(prefix.length, -target.mentionMinute.length - 2));
             });
         if (!calendar && !mention) return owners;
-        return owners.concat(children(row).filter(el => role(el) === 'AXGroup' && identifier(el) === 'Sticker' &&
-            !children(el).length && value(el, 'AXDescription') === description));
+        // Messages can expose a calendar balloon as a link instead of a group.
+        return owners.concat(children(row).filter(el => {
+            const kind = role(el);
+            return (kind === 'AXGroup' || (calendar && kind === 'AXLink')) && identifier(el) === 'Sticker' &&
+                !children(el).length && value(el, 'AXDescription') === description;
+        }));
     });
 }
 
@@ -615,10 +649,11 @@ function withTargetMenu(target, itemID, mode, useItem, prepare) {
         }, 2);
         if (!owner || !hasAction(owner, 'AXShowMenu')) throw new Error('Cannot bring the verified media balloon into view');
     }
+    const calendarLink = target.calendarMinute && role(owner) === 'AXLink';
     return withMenuItem(app, window, owner, () => {
         const found = targetOwners(requireTranscript().view, target);
         if (found.length !== 1 || !$.CFEqual(found[0], owner)) throw new Error('The target balloon changed');
-    }, itemID, item => useItem(item, context));
+    }, itemID, item => useItem(item, context), calendarLink ? () => showCalendarMenu(owner, target, mode) : null);
 }
 
 function react(args) {
@@ -774,10 +809,10 @@ function postKey(pid, events) {
     for (const event of events) $.CGEventPostToPid(pid, event);
 }
 
-function requireKeyAccess() {
+function requireEventAccess() {
     ObjC.import('Quartz');
     ObjC.bindFunction('CGPreflightPostEventAccess', ['bool', []]);
-    if (!$.CGPreflightPostEventAccess()) throw new Error('The helper cannot post a key to Messages');
+    if (!$.CGPreflightPostEventAccess()) throw new Error('The helper cannot post input events to Messages');
 }
 
 function dismissReply(context, open) {
@@ -785,7 +820,7 @@ function dismissReply(context, open) {
     if (!open || !emptyComposer(open) || !focus || !$.CFEqual(focus, open.field)) {
         throw new Error('Close the existing reply pane in Messages first');
     }
-    requireKeyAccess();
+    requireEventAccess();
     postKey(context.pid, keyEvents(53)); // Escape closes the empty reply pane.
 }
 
@@ -812,7 +847,7 @@ function reply(args) {
     if (dryRun) return withTargetMenu(target, 'reply…', '--dry-run');
     const part = `${target.part}:${target.part}:${target.kind ? 1 : target.text.length}`;
 
-    requireKeyAccess();
+    requireEventAccess();
     ObjC.bindFunction('AXUIElementIsAttributeSettable', ['int', ['id', 'id', 'bool*']]);
     ObjC.bindFunction('AXUIElementSetAttributeValue', ['int', ['id', 'id', 'id']]);
 
